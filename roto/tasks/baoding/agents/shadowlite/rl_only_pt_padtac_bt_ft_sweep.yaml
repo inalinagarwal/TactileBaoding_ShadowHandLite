@@ -1,0 +1,33 @@
+# Warm-start Optuna sweep: PadTac best -> shadowlite_padtac_bt.
+# Logs: Baoding_rl_only_pt_padtac_bt_ft_sweep_<study>/  (never rl_only_pt_padtac or rl_only_pt_padtac_bt_ft)
+
+agent:
+  rollouts: 32
+  learning_epochs: 8
+  mini_batches: 4
+  discount_factor: 0.99
+  lambda: 0.95
+  learning_rate: 1.0e-04
+  grad_norm_clip: 1.0
+  ratio_clip: 0.2
+  value_clip: 0.2
+  value_loss_scale: 1.0
+  entropy_loss_scale: 0.08
+  kl_threshold: 0
+
+experiment:
+  experiment_name: rl_only_pt_padtac_bt_ft_sweep
+  wandb: 0
+  wandb_kwargs:
+    group: rl_only_pt_padtac_bt_ft_sweep
+    name: '1'
+
+# Shorter trials than scratch (warm-start already juggles); seeded phase uses trainer.max below.
+trainer:
+  num_eval_envs: 100
+  max_global_timesteps_M: 250
+
+sweeper:
+  storage: sqlite:///shadow_baoding_padtac_bt_ft_sweep.db
+  warmup_timesteps_M: 40
+  max_sweep_timesteps_M: 100

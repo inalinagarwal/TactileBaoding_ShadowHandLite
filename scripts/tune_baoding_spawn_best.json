@@ -1,0 +1,42 @@
+{
+  "score": 98.74779797148705,
+  "baseline_score": 93.08574709099531,
+  "baseline_metrics": {
+    "mean_goal_align": 0.12125900387763977,
+    "mean_ball_dist": 0.0610329806804657,
+    "sep_penalty": 0.022932980680465696,
+    "min_z": 0.34344005584716797,
+    "fall_penalty": 0.0,
+    "palm_mid_err": 0.03926431015133858,
+    "target_offset": 0.022997045256110484,
+    "diagonal_target_x": -0.042997045256110485,
+    "diagonal_target_y": -0.1970029547438895,
+    "diagonal_target_z": 0.44299704525611044
+  },
+  "params": {
+    "ball_1_init_y": -0.1787006440525999,
+    "ball_2_init_y": -0.2360165308380872,
+    "ball_reset_height": 0.4944195787250866,
+    "ball_1_init_x": -0.015924777280111664,
+    "ball_2_init_x": -0.001091451014079689,
+    "palm_target_x": 0.002412641071286494,
+    "palm_target_y": -0.24124060305278108,
+    "palm_target_z": 0.40041174229724724
+  },
+  "metrics": {
+    "diagonal_target_x": -0.02058440418482399,
+    "diagonal_target_y": -0.2182435577966706,
+    "diagonal_target_z": 0.4234087875533577,
+    "fall_penalty": 0.0,
+    "mean_ball_dist": 0.0449918769299984,
+    "mean_goal_align": 0.019023090600967407,
+    "min_z": 0.39244282245635986,
+    "palm_mid_err": 0.01632099598646164,
+    "sep_penalty": 0.006891876929998396,
+    "target_offset": 0.022997045256110484
+  },
+  "cfg_snippet": "    ball_reset_height = 0.4944\n    ball_1_init_x = -0.0159\n    ball_1_init_y = -0.1787\n    ball_2_init_x = -0.0011\n    ball_2_init_y = -0.2360\n    palm_target_x = 0.0024\n    palm_target_y = -0.2412\n    palm_target_z = 0.4004\n    # target_offset = 0.022997  (auto from ball_diameter_m)\n    target_offset = ball_diameter_m / 1.73205080757 + 0.001\n    diagonal_target_x = palm_target_x - target_offset  # -> -0.0206\n    diagonal_target_y = palm_target_y + target_offset  # -> -0.2182\n    diagonal_target_z = palm_target_z + target_offset  # -> 0.4234\n",
+  "robot": "shadowlite_padtac",
+  "eval_steps": 10,
+  "num_envs": 8
+}

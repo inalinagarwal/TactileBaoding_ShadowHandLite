@@ -1,0 +1,52 @@
+{
+  "score": 95.68173670694232,
+  "baseline_score": 93.91888452246785,
+  "baseline_metrics": {
+    "correct_pairing": 0.12242226302623749,
+    "swap_pairing": 0.13821184635162354,
+    "swap_penalty": 0.015789583325386047,
+    "mean_b1_palm": 0.047400303184986115,
+    "mean_b2_diag": 0.07502195239067078,
+    "mean_ball_dist": 0.03984563797712326,
+    "sep_penalty": 0.01515436202287674,
+    "wrong_marker_penalty": 0.019328881055116653,
+    "min_z": 0.3896086812019348,
+    "fall_penalty": 0.0,
+    "target_offset": 0.022997045256110484,
+    "diagonal_target_x": -0.022997045256110484,
+    "diagonal_target_y": -0.1970029547438895,
+    "diagonal_target_z": 0.43299704525611044
+  },
+  "fixed_goals": {
+    "palm_target_x": 0.0,
+    "palm_target_y": -0.22,
+    "palm_target_z": 0.41
+  },
+  "params": {
+    "ball_reset_height": 0.44941647674266244,
+    "ball_1_init_x": -0.0016783398588229104,
+    "ball_1_init_y": -0.2173571292058358,
+    "ball_2_init_x": -0.04594223950512037,
+    "ball_2_init_y": -0.18494820535842904
+  },
+  "metrics": {
+    "correct_pairing": 0.08386808633804321,
+    "diagonal_target_x": -0.022997045256110484,
+    "diagonal_target_y": -0.1970029547438895,
+    "diagonal_target_z": 0.43299704525611044,
+    "fall_penalty": 0.0,
+    "mean_b1_palm": 0.03563050925731659,
+    "mean_b2_diag": 0.048237573355436325,
+    "mean_ball_dist": 0.05407141521573067,
+    "min_z": 0.39107856154441833,
+    "sep_penalty": 0.0009285847842693332,
+    "swap_pairing": 0.11552178859710693,
+    "swap_penalty": 0.03165370225906372,
+    "target_offset": 0.022997045256110484,
+    "wrong_marker_penalty": 0.0
+  },
+  "cfg_snippet": "    ball_reset_height = 0.4494\n    ball_1_init_x = -0.0017  # green \u2192 palm\n    ball_1_init_y = -0.2174\n    ball_2_init_x = -0.0459  # blue \u2192 diagonal\n    ball_2_init_y = -0.1849\n    # goals fixed (not optimized):\n    palm_target_x = 0.0000\n    palm_target_y = -0.2200\n    palm_target_z = 0.4100\n    target_offset = ball_diameter_m / 1.73205080757 + 0.001\n    diagonal_target_x = palm_target_x - target_offset  # -> -0.0230\n    diagonal_target_y = palm_target_y + target_offset  # -> -0.1970\n    diagonal_target_z = palm_target_z + target_offset  # -> 0.4330\n",
+  "robot": "shadowlite_padtac",
+  "eval_steps": 10,
+  "num_envs": 8
+}

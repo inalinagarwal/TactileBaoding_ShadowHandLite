@@ -1,0 +1,24 @@
+# Shadow Baoding: fine-tune padtac_bt from PadTac best @ 20 Hz RL
+# (matches deploy CONTROL_HZ=20). Full-speed actions — no velocity governor.
+# Logs: rl_only_pt_padtac_bt_ft_20hz/ — does NOT write rl_only_pt_padtac or _bt_ft.
+
+agent:
+  rollouts: 32
+  learning_epochs: 8
+  mini_batches: 4
+  discount_factor: 0.99
+  lambda: 0.95
+  learning_rate: 1.0e-04
+  grad_norm_clip: 1.0
+  ratio_clip: 0.2
+  value_clip: 0.2
+  value_loss_scale: 1.0
+  entropy_loss_scale: 0.08
+  kl_threshold: 0
+
+experiment:
+  experiment_name: rl_only_pt_padtac_bt_ft_20hz
+  wandb: 0
+  wandb_kwargs:
+    group: rl_only_pt_padtac_bt_ft_20hz
+    name: '1'
