@@ -219,6 +219,14 @@ class ShadowLiteEnvCfg(RotoEnvCfg):
     # (0.0, 15.0) to domain-randomize the tilt per episode.
     hand_tilt_range_deg: tuple[float, float] = (15.0, 15.0)
 
+    # Command rate limit (matches HW deploy SPEED_FRAC). Opt-in; default OFF so
+    # classic padtac_bt scratch (Trial-15/27) is unchanged.
+    #   Fixed:  cmd_speed_frac=0.5, cmd_speed_frac_range=None
+    #   DR:     cmd_speed_frac=None, cmd_speed_frac_range=(0.3, 1.0)
+    #   Off:    both None (default)
+    cmd_speed_frac: float | None = None
+    cmd_speed_frac_range: tuple[float, float] | None = None
+
     # GRDF coupling (experimental): derive the coupled J1/J2 commands from the
     # phase couplings declared in the GRDF robot file instead of the
     # coupling_theta split above. Same law today, but the coupling lives in the
@@ -348,6 +356,10 @@ class ShadowLiteEnv(RotoEnv):
 
         # Per-episode hand mounting-tilt DR.
         self._randomize_hand_tilt(env_ids)
+
+        # Per-episode command-rate DR (HW SPEED_FRAC); no-op if slew off / fixed.
+        if getattr(self, "use_cmd_slew", False):
+            self._sample_cmd_speed_frac(env_ids)
 
     # 0° "facing up" and 15° forward-tilt root quaternions (w, x, y, z); the tilt DR
     # interpolates between them.

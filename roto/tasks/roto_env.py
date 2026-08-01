@@ -127,6 +127,10 @@ class RotoEnv(DirectRLEnv):
         self.prev_joint_pos_cmd = torch.zeros((self.num_envs, self.robot.num_joints), device=self.device)
         self.joint_pos_error = torch.zeros((self.num_envs, self.robot.num_joints), device=self.device)
 
+        # Optional HW-matched command rate limit (see cfg.cmd_speed_frac*).
+        self.control_dt = float(self.cfg.sim.dt * self.cfg.decimation)
+        self._init_cmd_slew()
+
         # Indices of actuated joints
         self.actuated_dof_indices = [
             self.robot.joint_names.index(joint_name) for joint_name in cfg.actuated_joint_names
@@ -292,6 +296,8 @@ class RotoEnv(DirectRLEnv):
 
             # fill the 3 coupled J1 commands from the J2 drivers
             self._handle_coupled_joints()
+            # Rate-limit before settle snap so settling envs can still force default.
+            self._apply_cmd_slew()
 
             # Override pose for settling envs (no-op when settling is all-False).
             s_col = settling.unsqueeze(1)  # (num_envs, 1) broadcasts over joints
@@ -313,7 +319,65 @@ class RotoEnv(DirectRLEnv):
         else:
             # fill the 3 coupled J1 commands from the J2 drivers
             self._handle_coupled_joints()
+            self._apply_cmd_slew()
 
+    def _init_cmd_slew(self) -> None:
+        """Opt-in command rate limit matching HW deploy SPEED_FRAC.
+
+        cfg.cmd_speed_frac:
+          float -> fixed fraction for all envs
+          None  -> use range or disable
+        cfg.cmd_speed_frac_range:
+          (lo, hi) -> uniform DR per env (resampled on reset)
+          None     -> no DR
+        Both None -> slew off (classic Trial-15 behaviour).
+        """
+        fixed = getattr(self.cfg, "cmd_speed_frac", None)
+        rng = getattr(self.cfg, "cmd_speed_frac_range", None)
+        self.cmd_speed_frac_buf = torch.ones(self.num_envs, device=self.device, dtype=torch.float32)
+        self.use_cmd_slew = False
+        self._cmd_speed_frac_range = None
+
+        if fixed is not None:
+            self.use_cmd_slew = True
+            self.cmd_speed_frac_buf[:] = float(fixed)
+            print(f"[cmd_slew] fixed SPEED_FRAC={float(fixed)}")
+        elif rng is not None:
+            lo, hi = float(rng[0]), float(rng[1])
+            self.use_cmd_slew = True
+            self._cmd_speed_frac_range = (lo, hi)
+            self._sample_cmd_speed_frac(None)
+            print(f"[cmd_slew] DR SPEED_FRAC in [{lo}, {hi}]")
+        else:
+            print("[cmd_slew] off")
+
+    def _sample_cmd_speed_frac(self, env_ids) -> None:
+        """Resample per-env cmd_speed_frac (DR only)."""
+        if not self.use_cmd_slew or self._cmd_speed_frac_range is None:
+            return
+        lo, hi = self._cmd_speed_frac_range
+        if env_ids is None:
+            self.cmd_speed_frac_buf.uniform_(lo, hi)
+        else:
+            n = len(env_ids)
+            self.cmd_speed_frac_buf[env_ids] = torch.empty(
+                n, device=self.device, dtype=torch.float32
+            ).uniform_(lo, hi)
+
+    def _apply_cmd_slew(self) -> None:
+        """Clamp joint_pos_cmd step to vel_limit * speed_frac * control_dt."""
+        if not self.use_cmd_slew:
+            return
+        # (N, 1) * (1, J) * dt -> (N, J); same law as deploy SPEED_FRAC.
+        max_delta = (
+            self.cmd_speed_frac_buf.unsqueeze(1)
+            * self.robot_joint_vel_limits.unsqueeze(0)
+            * self.control_dt
+        )
+        delta = self.joint_pos_cmd - self.prev_joint_pos_cmd
+        self.joint_pos_cmd = self.prev_joint_pos_cmd + torch.clamp(
+            delta, -max_delta, max_delta
+        )
 
     def _handle_coupled_joints(self) -> None:
         """Split a single 'finger curl' proxy action into J2 and J1 commands.

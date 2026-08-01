@@ -6,20 +6,21 @@ PyTorch 1.4 legacy checkpoints). Python 3.5+; no f-strings, no 3.9 typing.
 
 Shows per-pad (C0..C11):
   - raw ADC trace (amber)
-  - resting baseline (cyan dashed)
-  - ON threshold = baseline + K_HI * noise (red dotted)
-  - binary lamp that lights the moment Schmitt trips ON
+  - resting baseline = p50 / median of empty capture (cyan dashed)
+  - ON threshold = p99.5(empty) + MARGIN_ABS (red dotted)
+  - binary lamp with hysteresis (ON above hi, OFF below lo = median + MARGIN_LO)
 
-Same 12-channel order / names as deploy_policy_new.py.
+Matches Trial 15 warmup deploy threshing (not the old K*sigma path).
 
 Controls
-  B  -- re-capture baseline+noise (~1.5 s; hand empty, cup pose preferred)
-  [ / ] -- decrease / increase K_HI (deploy default 5.0)
+  B  -- re-capture empty envelope (~3 s; hand empty, cup pose preferred;
+        move fingers gently if you want a motion-aware p99.5)
+  [ / ] -- decrease / increase MARGIN_ABS (default 5.0 ADC)
   Q / Esc -- quit
 
 Example
   python fsr_visualizer.py
-  python fsr_visualizer.py --port /dev/ttyACM0 --k-hi 5.0
+  python fsr_visualizer.py --port /dev/ttyACM0 --margin 5.0
 """
 
 from __future__ import print_function
@@ -40,24 +41,26 @@ try:
 except ImportError:
     raise SystemExit("Need pyserial: pip install pyserial")
 
-# ---- pad map (must match deploy_policy_new.py) ----
-# Wire-checked mux order (C5=rfmid, C6=palm, C11=ffmid); matches deploy_policy_new.py
+from fsr_pad_map import FSR_PAD_ENTRIES, N_FSR, print_mapping_table
+
+# (mux_label, site_name, sim_ch, usd_link, parent_link)
 PAD_META = [
-    ("C0", "thprox", 10),
-    ("C1", "ffprox", 7),
-    ("C2", "mfknuckle", 4),
-    ("C3", "rfprox", 9),
-    ("C4", "rfknuckle", 5),
-    ("C5", "rfmid", 13),
-    ("C6", "palm", 2),
-    ("C7", "ffknuckle", 3),
-    ("C8", "mfprox", 8),
-    ("C9", "thmiddle", 18),
-    ("C10", "mfmid", 12),
-    ("C11", "ffmid", 11),
+    (
+        "C%d" % e["mux"],
+        e["name"],
+        e["sim_ch"],
+        "rh_fsr_pad_%s" % e["usd"],
+        e["parent"],
+    )
+    for e in FSR_PAD_ENTRIES
 ]
-N_FSR = 12
 HISTORY = 250
+
+# Same defaults as deploy_warmup_trial15.py
+P_HI = 99.5
+P_LO = 50.0
+DEFAULT_MARGIN_ABS = 5.0
+DEFAULT_MARGIN_LO = 2.0
 
 # Visual theme
 BG = "#12141a"
@@ -123,21 +126,25 @@ class FSRStream(object):
 
 
 class Visualizer(object):
-    def __init__(self, stream, k_hi=5.0, k_lo=2.0, baseline_s=1.5):
+    def __init__(self, stream, margin_abs=5.0, margin_lo=2.0, baseline_s=3.0):
         self.stream = stream
-        self.k_hi = float(k_hi)
-        self.k_lo = float(k_lo)
+        self.margin_abs = float(margin_abs)
+        self.margin_lo = float(margin_lo)
         self.baseline_s = float(baseline_s)
 
         self.hist = [deque([0.0] * HISTORY, maxlen=HISTORY) for _ in range(N_FSR)]
         self.t0 = time.time()
         self.n_samples = 0
 
-        self.baseline = np.zeros(N_FSR)
-        self.noise = np.ones(N_FSR)
+        self.baseline = np.zeros(N_FSR)   # p50 / median of empty capture
+        self.p_hi = np.zeros(N_FSR)       # p99.5 of empty capture
+        self.fsr_hi = np.zeros(N_FSR)     # p99.5 + margin_abs
+        self.fsr_lo = np.zeros(N_FSR)     # median + margin_lo
         self.binary = np.zeros(N_FSR, dtype=bool)
         self.has_baseline = False
-        self.status = "Waiting for serial... press B after hand is empty to set baseline"
+        self.status = (
+            "Waiting for serial... press B after hand is empty to set p99.5 thresholds"
+        )
 
         self._baseline_buf = []
         self._capturing_baseline = False
@@ -156,7 +163,7 @@ class Visualizer(object):
 
         self.fig = plt.figure(figsize=(16, 9), facecolor=BG)
         try:
-            self.fig.canvas.manager.set_window_title("FSR Live - C0..C11")
+            self.fig.canvas.manager.set_window_title("FSR Live - C0..C11 (p99.5)")
         except Exception:
             pass
 
@@ -178,14 +185,14 @@ class Visualizer(object):
         self.lamps = []
         self.value_texts = []
 
-        for i, (cid, name, ch) in enumerate(PAD_META):
+        for i, (cid, name, ch, usd_link, parent) in enumerate(PAD_META):
             ax = self.fig.add_subplot(gs[i // 3, i % 3])
             ax.set_facecolor(AX_BG)
             for spine in ax.spines.values():
                 spine.set_color("#2a3140")
             (raw_ln,) = ax.plot([], [], color=RAW, lw=1.8, label="raw", zorder=3)
-            (base_ln,) = ax.plot([], [], color=BASE, lw=1.4, ls="--", label="baseline", zorder=2)
-            (thr_ln,) = ax.plot([], [], color=THRESH, lw=1.4, ls=":", label="ON threshold", zorder=2)
+            (base_ln,) = ax.plot([], [], color=BASE, lw=1.4, ls="--", label="median", zorder=2)
+            (thr_ln,) = ax.plot([], [], color=THRESH, lw=1.4, ls=":", label="p99.5+margin", zorder=2)
             ax.set_xlim(0, HISTORY)
             ax.set_ylim(0, 1)
             ax.tick_params(labelsize=7)
@@ -211,8 +218,8 @@ class Visualizer(object):
             )
 
             ax.set_title(
-                "%s  |  %s  |  sim ch %d" % (cid, name, ch),
-                loc="left", fontsize=10, color=TEXT, pad=6,
+                "%s | %s | ch %d | %s @ %s" % (cid, name, ch, usd_link, parent),
+                loc="left", fontsize=8, color=TEXT, pad=6,
             )
             vtxt = ax.text(
                 0.02, 0.95, "",
@@ -258,6 +265,13 @@ class Visualizer(object):
                 self.fig, self._update, interval=40, blit=False,
             )
 
+    def _refit_thresholds(self):
+        """Recompute hi/lo from locked p50/p99.5 using current margins."""
+        self.fsr_hi = self.p_hi + self.margin_abs
+        self.fsr_lo = self.baseline + self.margin_lo
+        # Keep hysteresis valid: lo must be strictly below hi.
+        self.fsr_lo = np.minimum(self.fsr_lo, self.fsr_hi - 1.0)
+
     def _on_key(self, event):
         if event.key in ("q", "escape"):
             plt.close(self.fig)
@@ -265,18 +279,27 @@ class Visualizer(object):
         elif event.key in ("b", "B"):
             self._start_baseline_capture()
         elif event.key == "[":
-            self.k_hi = max(1.0, self.k_hi - 0.5)
-            self.status = "K_HI = %.1f (lower = more sensitive)" % self.k_hi
+            self.margin_abs = max(0.0, self.margin_abs - 0.5)
+            if self.has_baseline:
+                self._refit_thresholds()
+            self.status = (
+                "MARGIN_ABS = %.1f (lower = more sensitive)" % self.margin_abs
+            )
         elif event.key == "]":
-            self.k_hi = min(20.0, self.k_hi + 0.5)
-            self.status = "K_HI = %.1f (higher = less sensitive)" % self.k_hi
+            self.margin_abs = min(50.0, self.margin_abs + 0.5)
+            if self.has_baseline:
+                self._refit_thresholds()
+            self.status = (
+                "MARGIN_ABS = %.1f (higher = less sensitive)" % self.margin_abs
+            )
 
     def _start_baseline_capture(self):
         self._baseline_buf = []
         self._capturing_baseline = True
         self._baseline_until = time.time() + self.baseline_s
         self.status = (
-            "Capturing baseline for %.1fs -- keep hand EMPTY (cup pose preferred)..."
+            "Capturing empty envelope for %.1fs -- keep hand EMPTY "
+            "(cup pose; gentle motion OK for motion-aware p99.5)..."
             % self.baseline_s
         )
 
@@ -286,25 +309,24 @@ class Visualizer(object):
             self.status = "Baseline capture failed (too few samples). Check serial."
             return
         s = np.array(self._baseline_buf)
-        self.baseline = s.mean(0)
-        self.noise = s.std(0) + 1e-6
+        self.baseline = np.percentile(s, P_LO, axis=0)
+        self.p_hi = np.percentile(s, P_HI, axis=0)
+        self._refit_thresholds()
         self.has_baseline = True
         self.binary[:] = False
         self.status = (
-            "Baseline locked | mean noise=%.2f | threshold = baseline + %.1f*sigma"
+            "Envelope locked | n=%d | hi = p%.1f + %.1f | lo = p%.1f + %.1f"
             " | tap pads to see spikes / binary ON"
-            % (self.noise.mean(), self.k_hi)
+            % (len(self._baseline_buf), P_HI, self.margin_abs, P_LO, self.margin_lo)
         )
 
     def _schmitt(self, raw):
         if not self.has_baseline:
             return
-        hi = self.baseline + self.k_hi * self.noise
-        lo = self.baseline + self.k_lo * self.noise
         for i in range(N_FSR):
-            if raw[i] > hi[i]:
+            if raw[i] > self.fsr_hi[i]:
                 self.binary[i] = True
-            elif raw[i] < lo[i]:
+            elif raw[i] < self.fsr_lo[i]:
                 self.binary[i] = False
 
     def _update(self, _frame):
@@ -333,11 +355,11 @@ class Visualizer(object):
 
             if self.has_baseline:
                 b = float(self.baseline[i])
-                n = float(self.noise[i])
+                thr = float(self.fsr_hi[i])
             else:
-                b = float(y.mean()) if len(y) else 0.0
-                n = max(float(y.std()), 1.0)
-            thr = b + self.k_hi * n
+                # live preview from rolling history before B locks
+                b = float(np.percentile(y, P_LO)) if len(y) else 0.0
+                thr = float(np.percentile(y, P_HI) + self.margin_abs) if len(y) else 1.0
 
             self.base_lines[i].set_data([0, HISTORY], [b, b])
             self.thr_lines[i].set_data([0, HISTORY], [thr, thr])
@@ -366,19 +388,20 @@ class Visualizer(object):
                 self.axes[i].title.set_color(TEXT)
 
             self.value_texts[i].set_text(
-                "raw %7.1f   base %7.1f   thr %7.1f   spike %+7.1f"
+                "raw %7.1f   med %7.1f   hi %7.1f   spike %+7.1f"
                 % (raw[i], b, thr, spike)
             )
             self.value_texts[i].set_color(ON_COL if on else MUTED)
 
         n_on = int(self.binary.sum()) if self.has_baseline else 0
         self.header.set_text(
-            "FSR Live Visualizer  |  K_HI=%.1f  K_LO=%.1f  |  binary ON: %d/12  |  samples: %d"
-            % (self.k_hi, self.k_lo, n_on, self.n_samples)
+            "FSR Live  |  hi=p%.1f+%.1f  lo=p%.1f+%.1f  |  binary ON: %d/12  |  samples: %d"
+            % (P_HI, self.margin_abs, P_LO, self.margin_lo, n_on, self.n_samples)
         )
         self.header.set_color(TEXT)
         self.footer.set_text(
-            "%s    |    keys:  B = set baseline   [ ] = K_HI   Q = quit" % self.status
+            "%s    |    keys:  B = capture envelope   [ ] = MARGIN   Q = quit"
+            % self.status
         )
         return []
 
@@ -395,16 +418,38 @@ class Visualizer(object):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Live FSR visualizer (C0-C11)")
+    ap = argparse.ArgumentParser(
+        description="Live FSR visualizer (C0-C11), p99.5 + margin thresholds"
+    )
     ap.add_argument("--port", default="/dev/ttyACM0", help="Arduino serial port")
     ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--k-hi", type=float, default=5.0,
-                    help="ON threshold = base + K_HI * sigma (deploy default 5)")
-    ap.add_argument("--k-lo", type=float, default=2.0,
-                    help="OFF threshold = base + K_LO * sigma")
-    ap.add_argument("--baseline-s", type=float, default=1.5,
-                    help="Seconds of empty capture for baseline")
+    ap.add_argument(
+        "--margin", type=float, default=DEFAULT_MARGIN_ABS,
+        help="ON margin: hi = p99.5(empty) + MARGIN (default %.1f)" % DEFAULT_MARGIN_ABS,
+    )
+    ap.add_argument(
+        "--margin-lo", type=float, default=DEFAULT_MARGIN_LO,
+        help="OFF margin: lo = median(empty) + MARGIN_LO (default %.1f)" % DEFAULT_MARGIN_LO,
+    )
+    ap.add_argument(
+        "--baseline-s", type=float, default=3.0,
+        help="Seconds of empty capture for p50/p99.5 envelope",
+    )
+    ap.add_argument(
+        "--print-map", action="store_true",
+        help="Print mux -> sim ch -> USD link table and exit (wire-check reference)",
+    )
+    # Keep old flags as aliases so existing laptop commands still work
+    ap.add_argument("--k-hi", type=float, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--k-lo", type=float, default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if args.print_map:
+        print_mapping_table()
+        return
+
+    margin_abs = args.margin if args.k_hi is None else float(args.k_hi)
+    margin_lo = args.margin_lo if args.k_lo is None else float(args.k_lo)
 
     stream = FSRStream(args.port, args.baud)
     stream.start()
@@ -412,13 +457,21 @@ def main():
     if stream.err:
         raise SystemExit("Cannot open %s: %s" % (args.port, stream.err))
 
-    print("FSR visualizer running.")
+    print("FSR visualizer running (p99.5 + margin).")
+    print("Pad map (mux CSV -> sim ch -> USD link):")
+    print_mapping_table()
+    print("")
     print("  Amber  = raw")
-    print("  Cyan   = baseline (rest)")
-    print("  Red    = ON threshold (baseline + K_HI*sigma)")
-    print("  Green lamp = binary ON (same Schmitt idea as deploy)")
-    print("Keys: B baseline | [ ] K_HI | Q quit")
-    viz = Visualizer(stream, k_hi=args.k_hi, k_lo=args.k_lo, baseline_s=args.baseline_s)
+    print("  Cyan   = median (p50) of empty capture")
+    print("  Red    = ON threshold (p99.5 + %.1f)" % margin_abs)
+    print("  Green lamp = binary ON (hysteresis; OFF below median + %.1f)" % margin_lo)
+    print("Keys: B capture envelope | [ ] MARGIN | Q quit")
+    viz = Visualizer(
+        stream,
+        margin_abs=margin_abs,
+        margin_lo=margin_lo,
+        baseline_s=args.baseline_s,
+    )
     try:
         viz.show()
     finally:

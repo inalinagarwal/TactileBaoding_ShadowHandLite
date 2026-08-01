@@ -1,34 +1,33 @@
 #!/usr/bin/env python
-"""Trial 15 deploy with empty-motion tactile warmup (Gate B style).
+"""Trial 27 deploy with empty-motion tactile warmup (p99.5 + margin).
 
-Flow (HAND EMPTY until Phase C):
-  A) Replay Trial-15 sim achieved-q  WARMUP_REPEATS times @ 60 Hz.
+Flow (HAND EMPTY until place-balls prompt):
+  A) Replay WARMUP_Q_FILE  WARMUP_REPEATS times @ 60 Hz (hand EMPTY).
      Log raw FSR (12) + BioTac PDC (5) every step.
-  B) Fit per-channel thresholds from empty-motion envelope:
-        hi = p99.5(raw) + 5 ADC
-        lo = median + 2 (narrow pads) or hi - HYST_BAND_WIDE (wide envelopes)
-     Hysteresis ON/OFF. mfprox live (FSR_MUTE_MUX empty after pad replace).
-     Save hw_warmup_trial15_fsr.npz for offline plots / sim comparison.
-  C) Move to sim rollout start pose q[0], prompt to place balls in the cup.
-  D) Closed-loop policy with REAL tactile @ SPEED_FRAC=0.5.
-     Save hw_policy_log_trial15_warmupcal.npz.
+  B) Fit per-channel envelope thresholds from empty motion:
+        hi = p99.5(empty) + MARGIN_ABS
+        lo = median + MARGIN_LO  (narrow pads)
+        lo = hi - HYST_BAND_WIDE (wide empty envelopes; less sticky hysteresis)
+     Hysteresis: ON if raw > hi, OFF if raw < lo.
+     Save hw_warmup_trial27_fsr.npz.
+  C) Prompt to place balls in the cup.
+  D) Mode switch (see POST_WARMUP_REPLAY_FILE below):
+       - str path: open-loop replay that sim-q file REPLAY_REPEATS times
+         with balls; log cmd/q/fsr/biotac/tac -> REPLAY_NPZ
+         (for HW vs sim tactile comparison; no policy / no checkpoint).
+       - None: closed-loop policy from CHECKPOINT @ SPEED_FRAC
+         -> POLICY_NPZ.
 
-Encoder check: on load, rospy logs missing/unexpected keys. You want
-  encoder missing=[] unexpected=[]
-If any net.* weights are missing, the encoder is partial — do not deploy.
-
-Does NOT modify deploy_policy_new.py.
+Does NOT modify deploy_policy_new.py or deploy_warmup_trial15.py.
 
 Laptop files needed next to this script (or absolute paths below):
-  sim_policy_log_trial15_seed42.npz
-  best_agent_legacy_padtac_bt_scratch_trial15.pt  (or under /home/user/experiments/)
+  sim_policy_log_trial27_seed0.npz
+  best_agent_legacy_padtac_bt_scratch_trial27.pt  (only if POST_WARMUP_REPLAY_FILE is None)
 """
 
 from __future__ import print_function
 
 import rospy
-import torch
-import torch.nn as nn
 import numpy as np
 from collections import deque
 
@@ -39,76 +38,52 @@ from sr_robot_msgs.msg import BiotacAll
 import serial
 import threading
 
-from fsr_pad_map import FSR_CHANNELS, FSR_NAMES
-
 # ============================================================
 # PATHS / PROTOCOL
 # ============================================================
-REPLAY_Q_FILE = "sim_policy_log_trial15_seed42.npz"  # must have q (T,16) + joints
-CHECKPOINT = "/home/user/experiments/best_agent_legacy_padtac_bt_scratch_trial15.pt"
+# Empty-warmup q trajectory (hand EMPTY).
+WARMUP_Q_FILE = "sim_policy_log_trial27_seed0.npz"  # must have q (T,16) + joints
+
+# After warmup + place balls:
+#   Set to a sim-q npz path -> open-loop replay only (no policy).
+#   Set to None            -> closed-loop policy from CHECKPOINT.
+# POST_WARMUP_REPLAY_FILE = "sim_policy_log_trial27_seed0.npz"
+POST_WARMUP_REPLAY_FILE = None  # policy mode
+
+CHECKPOINT = "/home/user/experiments/best_agent_legacy_padtac_bt_scratch_trial27.pt"
 
 WARMUP_REPEATS = 5
-WARMUP_NPZ = "hw_warmup_trial15_fsr.npz"
-POLICY_NPZ = "hw_policy_log_trial15_warmupcal.npz"
+REPLAY_REPEATS = 5
+WARMUP_NPZ = "hw_warmup_trial27_fsr.npz"
+REPLAY_NPZ = "hw_replay_trial27_withballs_tac.npz"  # with-balls open-loop + tac
+POLICY_NPZ = "hw_policy_log_trial27_warmupcal.npz"
 
 CONTROL_HZ = 60
-SPEED_FRAC = 0.5  # half-speed rate governor (successful HW setting)
+SPEED_FRAC = 0.5  # half-speed rate governor (policy mode only)
 
-# --- pos_err ablation (default off) ---
-# False (default): last_command = unslewed sim joint_pos_cmd (raw_cmd / j2_cmd).
-#   With SPEED_FRAC, plant tracks slewed pub but obs sees raw−q → artificial lag.
-# True: last_command = 13-d equivalent of published pub_target (after slew).
-#   pos_err ≈ 0 on stiff HW; tests whether bang-bang / velocity dominates over error.
-USE_PUBLISHED_CMD_FOR_POS_ERR = False
-
-# Empty-motion envelope thresholds (not K*std — std blows up on spike pads):
+# Empty-motion envelope thresholds (same as Trial 15 / fsr_visualizer):
 #   hi = percentile(warmup, P_HI) + MARGIN_ABS
 #   lo = percentile(warmup, P_LO) + MARGIN_LO   (narrow pads)
-#   lo = hi - HYST_BAND_WIDE                    (wide empty envelopes)
+#   lo = hi - HYST_BAND_WIDE                    (wide empty envelope)
 P_HI = 99.5
 P_LO = 50.0
 MARGIN_ABS = 5.0   # ADC counts above empty p99.5 -> ON
 MARGIN_LO = 2.0    # ADC counts above empty median -> release (narrow pads)
+# If empty (p99.5 - median) exceeds this, pad is "wide" — use a tight release
+# band under hi so hysteresis does not latch ON across the whole envelope
+# (e.g. rfprox: med~8, hi~50 -> lo~hi-3 instead of ~10).
 WIDE_ENVELOPE_ADC = 15.0
 HYST_BAND_WIDE = 3.0
-STD_FLOOR_BT = 1.0  # BioTac still uses a small noise floor for PDC
-# Legacy K*std (unused for FSR now; kept for optional BT fallback / docs):
-# K_HI, K_LO = 5.0, 2.0
+STD_FLOOR_BT = 1.0  # BioTac: guard if empty variance is tiny
 
 # ============================================================
-# MODEL
+# MODEL (policy mode only; torch imported lazily in run_policy)
 # ============================================================
 OBS_DIM = 304
 PROP_DIM = 52
 NUM_J = 13
 NUM_TACTILE = 24
 OBS_STACK = 4
-
-
-class Encoder(nn.Module):
-    def __init__(self):
-        super(Encoder, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(OBS_DIM, 1024), nn.LayerNorm(1024), nn.ELU(),
-            nn.Linear(1024, 512), nn.LayerNorm(512), nn.ELU(),
-            nn.Linear(512, 256), nn.LayerNorm(256), nn.ELU(),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class Policy(nn.Module):
-    def __init__(self):
-        super(Policy, self).__init__()
-        self.policy_net = nn.Sequential(
-            nn.Linear(256, 128), nn.ELU(),
-            nn.Linear(128, 64), nn.ELU(),
-            nn.Linear(64, NUM_J),
-        )
-
-    def forward(self, z):
-        return self.policy_net(z)
 
 
 # ============================================================
@@ -182,9 +157,16 @@ PUB_VEL_LIMIT = np.array(
     dtype=np.float32,
 )
 
-# Mux -> sim ch map: fsr_pad_map.py (wire-checked; matches shadow_padtac.usd).
-# Force these mux indices silent in the policy tactile vector (always 0).
+# Mux C0..C11 -> 24-d channel (wire-checked map)
+FSR_CHANNELS = [10, 7, 4, 9, 5, 13, 2, 3, 8, 18, 12, 11]
+FSR_NAMES = [
+    "C0_thprox", "C1_ffprox", "C2_mfknuckle", "C3_rfprox",
+    "C4_rfknuckle", "C5_rfmid", "C6_palm", "C7_ffknuckle",
+    "C8_mfprox", "C9_thmiddle", "C10_mfmid", "C11_ffmid",
+]
 N_FSR = 12
+# Force these mux indices silent in the policy tactile vector (always 0).
+# mfprox replaced — leave empty unless a channel is clearly broken again.
 FSR_MUTE_MUX = []
 BIOTAC_IDX = [0, 1, 2, 4]
 BIOTAC_CH = [15, 16, 17, 22]
@@ -227,46 +209,6 @@ def action_to_publish(action, meas_j2, prev_pub):
         pub = prev_pub + np.clip(pub - prev_pub, -max_delta, max_delta)
 
     return pub.astype(np.float32), raw_cmd, j2_cmd
-
-
-def pub16_to_cmd13(pub):
-    """Map published 16-d joint targets back to 13-d policy cmd_error space."""
-    cmd = np.empty(NUM_J, dtype=np.float32)
-    cmd[CTRL_NONCOUPLED] = pub[PUB_NONCOUPLED]
-    cmd[CURL_J2_IDX] = pub[PUB_J2_SLOTS]
-    return cmd
-
-
-def verify_encoder_load(load_result, checkpoint_path):
-    """Log whether the encoder checkpoint loaded completely (not partial).
-
-    On the control laptop, after ``rospy.init_node``, look for::
-
-        [INFO] Encoder load OK: all weights present ...
-
-    If you see ``ENCODER INCOMPLETE`` or missing ``net.*`` keys, stop — you would
-    be running a random or partial encoder.  Policy head uses strict=True separately.
-    """
-    missing = list(load_result.missing_keys)
-    unexpected = list(load_result.unexpected_keys)
-    weight_missing = [k for k in missing if k.startswith("net.")]
-    if weight_missing:
-        rospy.logerr(
-            "ENCODER INCOMPLETE — missing weight keys: %s  (checkpoint: %s)",
-            weight_missing, checkpoint_path,
-        )
-    elif missing:
-        rospy.logwarn(
-            "Encoder missing_keys (non-weight; verify harmless): %s", missing,
-        )
-    else:
-        rospy.loginfo(
-            "Encoder load OK: all weights present (not partial). checkpoint=%s",
-            checkpoint_path,
-        )
-    if unexpected:
-        rospy.logwarn("Encoder unexpected_keys: %s", unexpected)
-    return not weight_missing
 
 
 # ============================================================
@@ -352,12 +294,16 @@ def publish_target(pub, target, duration):
 
 
 def _lo_from_envelope(baseline, phi, hi):
-    """Release threshold: tight band under hi for wide empty envelopes."""
+    """Release threshold: tight band under hi for wide empty envelopes.
+
+    baseline/phi/hi: arrays (per-channel). Returns lo array.
+    """
     envelope = (phi - baseline).astype(np.float32)
     lo_narrow = (baseline + MARGIN_LO).astype(np.float32)
     lo_wide = (hi - HYST_BAND_WIDE).astype(np.float32)
     wide = envelope > WIDE_ENVELOPE_ADC
     lo = np.where(wide, lo_wide, lo_narrow).astype(np.float32)
+    # Keep hysteresis valid: lo must be strictly below hi.
     lo = np.minimum(lo, hi - 1.0).astype(np.float32)
     return lo, wide, envelope
 
@@ -365,9 +311,9 @@ def _lo_from_envelope(baseline, phi, hi):
 def fit_thresholds_from_warmup(fsr_arr, bt_arr):
     """fsr_arr (N,12), bt_arr (N,5) with NaNs possible on BT.
 
-    FSR: hi = p99.5(empty) + MARGIN_ABS.
+    FSR / BioTac: hi = p99.5(empty) + MARGIN_ABS.
     lo = median + MARGIN_LO on narrow pads; hi - HYST_BAND_WIDE on wide pads.
-    BioTac PDC: same idea on valid samples.
+    Runtime uses hysteresis (see read_tactile).
     """
     global fsr_baseline, fsr_noise, fsr_hi, fsr_lo
     global bt_baseline, bt_noise, bt_hi, bt_lo
@@ -383,6 +329,7 @@ def fit_thresholds_from_warmup(fsr_arr, bt_arr):
     bt_noise = np.ones(N_BIOTAC, dtype=np.float32)
     bt_hi = np.zeros(N_BIOTAC, dtype=np.float32)
     bt_lo = np.zeros(N_BIOTAC, dtype=np.float32)
+    bt_wide = np.zeros(N_BIOTAC, dtype=bool)
     for k in range(N_BIOTAC):
         col = bt_sel[:, k]
         valid = col[np.isfinite(col) & (col > 0)]
@@ -397,12 +344,13 @@ def fit_thresholds_from_warmup(fsr_arr, bt_arr):
             bt_noise[k] = max(float(valid.std()), STD_FLOOR_BT)
             phi = float(np.percentile(valid, P_HI))
             bt_hi[k] = float(phi + MARGIN_ABS)
-            lo_arr, _, _ = _lo_from_envelope(
+            lo_arr, wide_arr, _ = _lo_from_envelope(
                 np.array([bt_baseline[k]], dtype=np.float32),
                 np.array([phi], dtype=np.float32),
                 np.array([bt_hi[k]], dtype=np.float32),
             )
             bt_lo[k] = float(lo_arr[0])
+            bt_wide[k] = bool(wide_arr[0])
 
     rospy.loginfo(
         "FSR thresh mode=p%.1f+%.1f / lo=med+%.1f or hi-%.1f if env>%.1f",
@@ -416,7 +364,8 @@ def fit_thresholds_from_warmup(fsr_arr, bt_arr):
     rospy.loginfo("FSR lo=%s", fsr_lo)
     rospy.loginfo("FSR_MUTE_MUX=%s (%s)", FSR_MUTE_MUX,
                   [FSR_NAMES[i] for i in FSR_MUTE_MUX])
-    rospy.loginfo("BioTac baseline=%s hi=%s", bt_baseline, bt_hi)
+    rospy.loginfo("BioTac baseline=%s hi=%s lo=%s wide=%s",
+                  bt_baseline, bt_hi, bt_lo, bt_wide.tolist())
 
 
 def apply_fsr_mute(fsr_on):
@@ -431,6 +380,7 @@ def read_tactile():
     global fsr_state, bt_state
     with fsr_lock:
         fsr_vals = latest_fsr.copy()
+    # Hysteresis: ON above hi, OFF below lo, else hold
     fsr_state = np.where(
         fsr_vals > fsr_hi,
         True,
@@ -462,8 +412,12 @@ def build_prop():
     return np.concatenate([pos_norm, vel_norm, error, last_action]).astype(np.float32)
 
 
-def run_q_replay(pub, rec_q, episode_id, log):
-    """One open-loop replay of sim achieved q. Appends to log dicts."""
+def run_q_replay(pub, rec_q, episode_id, log, log_tac=False):
+    """One open-loop replay of sim achieved q. Appends to log dicts.
+
+    If log_tac=True, also append binary tactile from read_tactile() each step
+    (uses thresholds fitted after empty warmup).
+    """
     rate = rospy.Rate(CONTROL_HZ)
     for q_sim in rec_q:
         if rospy.is_shutdown():
@@ -479,13 +433,198 @@ def run_q_replay(pub, rec_q, episode_id, log):
             log["fsr"].append(latest_fsr.copy())
         with bt_lock:
             log["biotac_pdc"].append(latest_biotac_pdc.copy())
+        if log_tac:
+            log["tac"].append(read_tactile())
         rate.sleep()
+
+
+def load_q_npz(path):
+    data = np.load(path, allow_pickle=True)
+    rec_q = data["q"].astype(np.float32)
+    assert rec_q.ndim == 2 and rec_q.shape[1] == 16, rec_q.shape
+    if "joints" in data.files:
+        assert list(data["joints"]) == PUBLISH_JOINTS, (list(data["joints"]), PUBLISH_JOINTS)
+    return rec_q
+
+
+def run_with_balls_replay(pub, rec_q):
+    """Open-loop with-balls replay x REPLAY_REPEATS; save REPLAY_NPZ."""
+    global fsr_state, bt_state
+
+    fsr_state[:] = False
+    bt_state[:] = False
+
+    first = np.clip(rec_q[0], PUB_LOWER, PUB_UPPER)
+    publish_target(pub, first, 2.0)
+    rospy.sleep(2.0)
+
+    log = {
+        "t": [], "episode": [], "cmd": [], "q": [],
+        "fsr": [], "biotac_pdc": [], "tac": [],
+    }
+    for ep in range(REPLAY_REPEATS):
+        rospy.loginfo("With-balls q-replay %d/%d", ep + 1, REPLAY_REPEATS)
+        run_q_replay(pub, rec_q, ep, log, log_tac=True)
+        rospy.sleep(0.3)
+
+    tac = np.asarray(log["tac"], dtype=np.float32)
+    np.savez(
+        REPLAY_NPZ,
+        t=np.asarray(log["t"]),
+        episode=np.asarray(log["episode"], dtype=np.int32),
+        cmd=np.asarray(log["cmd"], dtype=np.float32),
+        q=np.asarray(log["q"], dtype=np.float32),
+        fsr=np.asarray(log["fsr"], dtype=np.float32),
+        biotac_pdc=np.asarray(log["biotac_pdc"], dtype=np.float32),
+        tac=tac,
+        fsr_names=np.array(FSR_NAMES),
+        biotac_names=np.array(BIOTAC_NAMES),
+        fsr_channels=np.array(FSR_CHANNELS, dtype=np.int32),
+        biotac_channels=np.array(BIOTAC_CH, dtype=np.int32),
+        biotac_idx=np.array(BIOTAC_IDX, dtype=np.int32),
+        fsr_baseline=fsr_baseline,
+        fsr_hi=fsr_hi,
+        fsr_lo=fsr_lo,
+        bt_baseline=bt_baseline,
+        bt_hi=bt_hi,
+        bt_lo=bt_lo,
+        MARGIN_ABS=np.float32(MARGIN_ABS),
+        MARGIN_LO=np.float32(MARGIN_LO),
+        P_HI=np.float32(P_HI),
+        P_LO=np.float32(P_LO),
+        WIDE_ENVELOPE_ADC=np.float32(WIDE_ENVELOPE_ADC),
+        HYST_BAND_WIDE=np.float32(HYST_BAND_WIDE),
+        thresh_mode=np.array("p99_5_plus_margin_hysteresis_wide_tight"),
+        fsr_mute_mux=np.array(FSR_MUTE_MUX, dtype=np.int32),
+        joints=PUBLISH_JOINTS,
+        warmup_file=WARMUP_NPZ,
+        warmup_q_file=WARMUP_Q_FILE,
+        replay_file=POST_WARMUP_REPLAY_FILE,
+        replay_repeats=np.int32(REPLAY_REPEATS),
+        speed_frac=np.float32(-1.0),  # open-loop: governor not applied
+    )
+    rospy.loginfo("Saved with-balls replay -> %s  (%d steps)", REPLAY_NPZ, len(tac))
+    rospy.loginfo("With-balls binary tac: any=%.1f%% mean ON ch/step=%.2f",
+                  100.0 * (tac > 0.5).any(axis=1).mean(),
+                  float(tac.sum(axis=1).mean()))
+    for i, name in enumerate(FSR_NAMES):
+        rospy.loginfo("  %s  ON=%.1f%%", name, 100.0 * tac[:, FSR_CHANNELS[i]].mean())
+    for k, name in enumerate(BIOTAC_NAMES):
+        rospy.loginfo("  %s  ON=%.1f%%", name, 100.0 * tac[:, BIOTAC_CH[k]].mean())
+
+
+def run_policy(pub):
+    """Closed-loop policy until Ctrl-C; save POLICY_NPZ."""
+    global last_action, last_command, fsr_state, bt_state
+
+    import torch
+    import torch.nn as nn
+
+    class Encoder(nn.Module):
+        def __init__(self):
+            super(Encoder, self).__init__()
+            self.net = nn.Sequential(
+                nn.Linear(OBS_DIM, 1024), nn.LayerNorm(1024), nn.ELU(),
+                nn.Linear(1024, 512), nn.LayerNorm(512), nn.ELU(),
+                nn.Linear(512, 256), nn.LayerNorm(256), nn.ELU(),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
+    class Policy(nn.Module):
+        def __init__(self):
+            super(Policy, self).__init__()
+            self.policy_net = nn.Sequential(
+                nn.Linear(256, 128), nn.ELU(),
+                nn.Linear(128, 64), nn.ELU(),
+                nn.Linear(64, NUM_J),
+            )
+
+        def forward(self, z):
+            return self.policy_net(z)
+
+    rospy.loginfo("Loading checkpoint: %s", CHECKPOINT)
+    ckpt = torch.load(CHECKPOINT, map_location="cpu")
+    encoder, policy = Encoder(), Policy()
+    e_res = encoder.load_state_dict(ckpt["encoder"], strict=False)
+    rospy.loginfo("encoder missing=%s unexpected=%s", e_res.missing_keys, e_res.unexpected_keys)
+    policy.load_state_dict(
+        {k: v for k, v in ckpt["policy"].items() if k != "log_std_parameter"},
+        strict=True,
+    )
+    encoder.eval()
+    policy.eval()
+
+    fsr_state[:] = False
+    bt_state[:] = False
+    last_command[:] = current_joint_pos
+    last_action[:] = 0.0
+    p0, t0 = build_prop(), read_tactile()
+    prop_buffer.clear()
+    tactile_buffer.clear()
+    for _ in range(OBS_STACK):
+        prop_buffer.append(p0.copy())
+        tactile_buffer.append(t0.copy())
+
+    rospy.sleep(1.0)
+    rate = rospy.Rate(CONTROL_HZ)
+    prev_pub = None
+    rec = {"t": [], "q": [], "cmd": [], "tac": [], "fsr": [], "biotac_pdc": [], "act": []}
+    rospy.loginfo("Policy loop @ %d Hz | motion-calibrated tactile | governor=%s",
+                  CONTROL_HZ, SPEED_FRAC)
+
+    try:
+        while not rospy.is_shutdown():
+            prop_buffer.append(build_prop())
+            tactile_buffer.append(read_tactile())
+            obs = np.concatenate(list(prop_buffer) + list(tactile_buffer))
+            assert obs.shape[0] == OBS_DIM, obs.shape
+            obs_t = torch.from_numpy(obs).unsqueeze(0)
+
+            with torch.no_grad():
+                action = policy(encoder(obs_t)).numpy()[0].astype(np.float32)
+
+            pub_target, raw_cmd, j2_cmd = action_to_publish(
+                action, current_joint_pos[CURL_J2_IDX], prev_pub
+            )
+            prev_pub = pub_target
+            publish_target(pub, pub_target, 1.0 / CONTROL_HZ)
+
+            rec["t"].append(rospy.get_time())
+            rec["q"].append(current_joint_pos.copy())
+            rec["cmd"].append(pub_target.copy())
+            rec["tac"].append(tactile_buffer[-1].copy())
+            with fsr_lock:
+                rec["fsr"].append(latest_fsr.copy())
+            with bt_lock:
+                rec["biotac_pdc"].append(latest_biotac_pdc.copy())
+            rec["act"].append(action.copy())
+
+            last_action[:] = action
+            last_command[:] = raw_cmd
+            last_command[CURL_J2_IDX] = j2_cmd
+            rate.sleep()
+    finally:
+        if rec["t"]:
+            np.savez(
+                POLICY_NPZ,
+                **{k: np.array(v) for k, v in rec.items()},
+                fsr_baseline=fsr_baseline,
+                fsr_hi=fsr_hi,
+                fsr_lo=fsr_lo,
+                bt_baseline=bt_baseline,
+                bt_hi=bt_hi,
+                bt_lo=bt_lo,
+                warmup_file=WARMUP_NPZ,
+            )
+            rospy.loginfo("saved %s: %d steps", POLICY_NPZ, len(rec["t"]))
 
 
 def main():
     global last_action, last_command, fsr_state, bt_state
 
-    rospy.init_node("deploy_warmup_trial15")
+    rospy.init_node("deploy_warmup_trial27")
     pub = rospy.Publisher("/rh_trajectory_controller/command", JointTrajectory, queue_size=1)
     rospy.Subscriber("/joint_states", JointState, joint_callback)
     rospy.Subscriber("/rh/tactile", BiotacAll, biotac_cb, queue_size=1)
@@ -505,21 +644,21 @@ def main():
     th.start()
     rospy.sleep(0.5)
 
-    # ----- load Trial-15 q replay -----
-    data = np.load(REPLAY_Q_FILE, allow_pickle=True)
-    rec_q = data["q"].astype(np.float32)
-    assert rec_q.ndim == 2 and rec_q.shape[1] == 16, rec_q.shape
-    if "joints" in data.files:
-        assert list(data["joints"]) == PUBLISH_JOINTS, (list(data["joints"]), PUBLISH_JOINTS)
-    rospy.loginfo("Loaded %s  T=%d for warmup x%d", REPLAY_Q_FILE, len(rec_q), WARMUP_REPEATS)
+    # ----- empty warmup -----
+    warmup_q = load_q_npz(WARMUP_Q_FILE)
+    rospy.loginfo("Loaded warmup q %s  T=%d x%d", WARMUP_Q_FILE, len(warmup_q), WARMUP_REPEATS)
+    if POST_WARMUP_REPLAY_FILE:
+        rospy.loginfo("Mode: WITH-BALLS OPEN-LOOP REPLAY (%s x%d) -> %s",
+                      POST_WARMUP_REPLAY_FILE, REPLAY_REPEATS, REPLAY_NPZ)
+    else:
+        rospy.loginfo("Mode: CLOSED-LOOP POLICY (%s) -> %s", CHECKPOINT, POLICY_NPZ)
 
     input(
         "HAND EMPTY — cup pose ready. Press Enter to start %d x q-replay warmup..."
         % WARMUP_REPEATS
     )
 
-    # Move to first frame, settle
-    first = np.clip(rec_q[0], PUB_LOWER, PUB_UPPER)
+    first = np.clip(warmup_q[0], PUB_LOWER, PUB_UPPER)
     publish_target(pub, first, 2.0)
     rospy.sleep(3.0)
 
@@ -529,20 +668,17 @@ def main():
     }
     for ep in range(WARMUP_REPEATS):
         rospy.loginfo("Warmup replay %d/%d", ep + 1, WARMUP_REPEATS)
-        run_q_replay(pub, rec_q, ep, warmup)
-        # brief pause between repeats (hold last pose)
+        run_q_replay(pub, warmup_q, ep, warmup, log_tac=False)
         rospy.sleep(0.3)
 
     fsr_arr = np.asarray(warmup["fsr"], dtype=np.float32)
     bt_arr = np.asarray(warmup["biotac_pdc"], dtype=np.float32)
     fit_thresholds_from_warmup(fsr_arr, bt_arr)
 
-    # Approximate binary ON rates under fitted thresholds (causal hysteresis replay)
+    tac_warmup = []
     fsr_state[:] = False
     bt_state[:] = False
-    tac_warmup = []
     for i in range(len(fsr_arr)):
-        # feed hysteresis as if streaming
         fsr_vals = fsr_arr[i]
         fsr_state[:] = np.where(
             fsr_vals > fsr_hi, True, np.where(fsr_vals < fsr_lo, False, fsr_state)
@@ -587,18 +723,21 @@ def main():
         bt_noise=bt_noise,
         bt_hi=bt_hi,
         bt_lo=bt_lo,
-        P_HI=np.float32(P_HI),
-        P_LO=np.float32(P_LO),
         MARGIN_ABS=np.float32(MARGIN_ABS),
         MARGIN_LO=np.float32(MARGIN_LO),
+        P_HI=np.float32(P_HI),
+        P_LO=np.float32(P_LO),
         WIDE_ENVELOPE_ADC=np.float32(WIDE_ENVELOPE_ADC),
         HYST_BAND_WIDE=np.float32(HYST_BAND_WIDE),
         thresh_mode=np.array("p99_5_plus_margin_hysteresis_wide_tight"),
         fsr_mute_mux=np.array(FSR_MUTE_MUX, dtype=np.int32),
         joints=PUBLISH_JOINTS,
-        replay_file=REPLAY_Q_FILE,
+        replay_file=WARMUP_Q_FILE,
         warmup_repeats=np.int32(WARMUP_REPEATS),
         speed_frac=np.float32(SPEED_FRAC if SPEED_FRAC is not None else -1.0),
+        post_warmup_mode=np.array(
+            "replay" if POST_WARMUP_REPLAY_FILE else "policy"
+        ),
     )
     rospy.loginfo("Saved warmup sensors -> %s  (%d steps)", WARMUP_NPZ, len(fsr_arr))
     rospy.loginfo("Empty-motion binary ON%% (should be low):")
@@ -611,104 +750,20 @@ def main():
                       name, 100.0 * tac_warmup[:, BIOTAC_CH[k]].mean(),
                       bt_baseline[k], bt_hi[k])
 
-    # Move to sim rollout START (q[0]), not end-of-replay pose — matches closed-loop IC.
-    policy_start_q = np.clip(rec_q[0], PUB_LOWER, PUB_UPPER)
-    rospy.loginfo(
-        "Warmup done. Moving to sim q[0] (policy start pose) from %s ...",
-        REPLAY_Q_FILE,
-    )
-    publish_target(pub, policy_start_q, 2.0)
-    rospy.sleep(3.0)
+    if warmup["cmd"]:
+        publish_target(pub, np.asarray(warmup["cmd"][-1], dtype=np.float32), 1.0)
 
-    input(
-        "At sim q[0]. PLACE BALLS in cup, then press Enter to start POLICY..."
-    )
-
-    # ----- load policy -----
-    rospy.loginfo("Loading checkpoint: %s", CHECKPOINT)
-    ckpt = torch.load(CHECKPOINT, map_location="cpu")
-    encoder, policy = Encoder(), Policy()
-    e_res = encoder.load_state_dict(ckpt["encoder"], strict=False)
-    verify_encoder_load(e_res, CHECKPOINT)
-    rospy.loginfo("encoder missing=%s unexpected=%s", e_res.missing_keys, e_res.unexpected_keys)
-    policy.load_state_dict(
-        {k: v for k, v in ckpt["policy"].items() if k != "log_std_parameter"},
-        strict=True,
-    )
-    encoder.eval()
-    policy.eval()
-
-    fsr_state[:] = False
-    bt_state[:] = False
-    last_command[:] = current_joint_pos
-    last_action[:] = 0.0
-    p0, t0 = build_prop(), read_tactile()
-    prop_buffer.clear()
-    tactile_buffer.clear()
-    for _ in range(OBS_STACK):
-        prop_buffer.append(p0.copy())
-        tactile_buffer.append(t0.copy())
-
-    rospy.sleep(1.0)
-    rate = rospy.Rate(CONTROL_HZ)
-    prev_pub = None
-    rec = {"t": [], "q": [], "cmd": [], "tac": [], "fsr": [], "biotac_pdc": [], "act": []}
-    rospy.loginfo(
-        "Policy loop @ %d Hz | motion-calibrated tactile | governor=%s | "
-        "pos_err_from_pub=%s",
-        CONTROL_HZ, SPEED_FRAC, USE_PUBLISHED_CMD_FOR_POS_ERR,
-    )
-
-    try:
-        while not rospy.is_shutdown():
-            prop_buffer.append(build_prop())
-            tactile_buffer.append(read_tactile())
-            obs = np.concatenate(list(prop_buffer) + list(tactile_buffer))
-            assert obs.shape[0] == OBS_DIM, obs.shape
-            obs_t = torch.from_numpy(obs).unsqueeze(0)
-
-            with torch.no_grad():
-                action = policy(encoder(obs_t)).numpy()[0].astype(np.float32)
-
-            pub_target, raw_cmd, j2_cmd = action_to_publish(
-                action, current_joint_pos[CURL_J2_IDX], prev_pub
-            )
-            prev_pub = pub_target
-            publish_target(pub, pub_target, 1.0 / CONTROL_HZ)
-
-            rec["t"].append(rospy.get_time())
-            rec["q"].append(current_joint_pos.copy())
-            rec["cmd"].append(pub_target.copy())
-            rec["tac"].append(tactile_buffer[-1].copy())
-            with fsr_lock:
-                rec["fsr"].append(latest_fsr.copy())
-            with bt_lock:
-                rec["biotac_pdc"].append(latest_biotac_pdc.copy())
-            rec["act"].append(action.copy())
-
-            last_action[:] = action
-            if USE_PUBLISHED_CMD_FOR_POS_ERR:
-                # Ablation: cmd_error tracks what the plant actually received (slewed).
-                last_command[:] = pub16_to_cmd13(pub_target)
-            else:
-                last_command[:] = raw_cmd
-                last_command[CURL_J2_IDX] = j2_cmd
-            rate.sleep()
-    finally:
-        if rec["t"]:
-            np.savez(
-                POLICY_NPZ,
-                **{k: np.array(v) for k, v in rec.items()},
-                fsr_baseline=fsr_baseline,
-                fsr_hi=fsr_hi,
-                fsr_lo=fsr_lo,
-                bt_baseline=bt_baseline,
-                bt_hi=bt_hi,
-                bt_lo=bt_lo,
-                warmup_file=WARMUP_NPZ,
-                use_published_cmd_for_pos_err=USE_PUBLISHED_CMD_FOR_POS_ERR,
-            )
-            rospy.loginfo("saved %s: %d steps", POLICY_NPZ, len(rec["t"]))
+    if POST_WARMUP_REPLAY_FILE:
+        input(
+            "Warmup done. PLACE BALLS in cup, then press Enter to start "
+            "%d x WITH-BALLS q-REPLAY..." % REPLAY_REPEATS
+        )
+        balls_q = load_q_npz(POST_WARMUP_REPLAY_FILE)
+        rospy.loginfo("Loaded balls-replay q %s  T=%d", POST_WARMUP_REPLAY_FILE, len(balls_q))
+        run_with_balls_replay(pub, balls_q)
+    else:
+        input("Warmup done. PLACE BALLS in cup, then press Enter to start POLICY...")
+        run_policy(pub)
 
 
 if __name__ == "__main__":

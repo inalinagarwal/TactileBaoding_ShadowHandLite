@@ -36,6 +36,12 @@ parser.add_argument("--video_dir", type=str, default=None, help="Directory to sa
 parser.add_argument("--agent_cfg", type=str, default=None, help="Name of the agent configuration.")
 
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment.")
+parser.add_argument(
+    "--record_steps",
+    type=int,
+    default=300,
+    help="Number of control steps to log into sim_policy_log_seed*.npz (60 Hz → 300=5s, 600=10s, 900=15s).",
+)
 # Rendering options (useful for RTX5090 and similar GPUs)
 parser.add_argument(
     "--renderer", type=str, default="PathTracing", choices=["RayTracedLighting", "PathTracing"], help="Renderer to use."
@@ -174,9 +180,24 @@ def main():
                     print(k, type(v))
 
     r = env.env.unwrapped
-    idx = r.actuated_dof_indices
-    N_RECORD = 300
-    rec = {'act': [], 'q': [], 'cmd': [], 'tac': []}
+    idx = r.actuated_dof_indices          # 16: full actuated (incl. J1 mimics)
+    prop_idx = r.prop_dof_indices         # 13: policy proprio / control joints (ShadowLite)
+    N_RECORD = int(args_cli.record_steps)
+    print(f"[INFO] Recording {N_RECORD} steps (~{N_RECORD / 60.0:.1f}s at 60 Hz) into sim_policy_log_seed*.npz")
+    # After env.step, roto_env._compute_intermediate_values() has filled
+    # r.joint_vel and r.joint_pos_error (= joint_pos_cmd - joint_pos).
+    rec = {
+        "act": [],          # (13,) policy output (unitless)
+        "q": [],            # (16,) achieved pos rad
+        "cmd": [],          # (16,) joint_pos_cmd rad
+        "qd": [],           # (16,) joint vel rad/s
+        "pos_err": [],      # (16,) cmd - q  rad
+        "q13": [],          # (13,) policy-order achieved pos
+        "qd13": [],         # (13,) policy-order vel
+        "cmd13": [],        # (13,) policy-order cmd
+        "pos_err13": [],    # (13,) policy-order cmd - q  (matches obs cmd_error)
+        "tac": [],          # (24,) binary tactile
+    }
 
     # Simulate environment
     while simulation_app.is_running():
@@ -188,15 +209,24 @@ def main():
             # Environment stepping
             states, rewards, terminated, truncated, infos = env.step(actions)
 
-            rec["act"].append(actions[0].detach().cpu().numpy().copy())               # normalized action (canonical input)
-            rec["q"].append(r.robot.data.joint_pos[0, idx].detach().cpu().numpy().copy())   # achieved (rad)
-            rec["cmd"].append(r.joint_pos_cmd[0, idx].detach().cpu().numpy().copy())  
-            rec["tac"].append(r.tactile[0].detach().cpu().numpy().copy())                   # binary tactile (24)
+            rec["act"].append(actions[0].detach().cpu().numpy().copy())
+            rec["q"].append(r.robot.data.joint_pos[0, idx].detach().cpu().numpy().copy())
+            rec["cmd"].append(r.joint_pos_cmd[0, idx].detach().cpu().numpy().copy())
+            rec["qd"].append(r.joint_vel[0, idx].detach().cpu().numpy().copy())
+            rec["pos_err"].append(r.joint_pos_error[0, idx].detach().cpu().numpy().copy())
+            rec["q13"].append(r.joint_pos[0, prop_idx].detach().cpu().numpy().copy())
+            rec["qd13"].append(r.joint_vel[0, prop_idx].detach().cpu().numpy().copy())
+            rec["cmd13"].append(r.joint_pos_cmd[0, prop_idx].detach().cpu().numpy().copy())
+            rec["pos_err13"].append(r.joint_pos_error[0, prop_idx].detach().cpu().numpy().copy())
+            rec["tac"].append(r.tactile[0].detach().cpu().numpy().copy())
             if len(rec["act"]) >= N_RECORD:
                 fname = f"sim_policy_log_seed{agent_cfg['seed']}.npz"     # was "sim_policy_log.npz"
-                np.savez(fname,
-                         **{k: np.array(v) for k, v in rec.items()},
-                         joints=[r.robot.joint_names[i] for i in idx])
+                np.savez(
+                    fname,
+                    **{k: np.array(v) for k, v in rec.items()},
+                    joints=[r.robot.joint_names[i] for i in idx],
+                    joints13=[r.robot.joint_names[i] for i in prop_idx],
+                )
                 print("saved", fname, len(rec["act"]), "steps")
                 break
     
@@ -223,6 +253,17 @@ def main():
                 break
 
         timestep += 1
+
+    # If video ended before N_RECORD, still flush whatever we logged.
+    if rec["act"] and len(rec["act"]) < N_RECORD:
+        fname = f"sim_policy_log_seed{agent_cfg['seed']}.npz"
+        np.savez(
+            fname,
+            **{k: np.array(v) for k, v in rec.items()},
+            joints=[r.robot.joint_names[i] for i in idx],
+            joints13=[r.robot.joint_names[i] for i in prop_idx],
+        )
+        print("saved (partial)", fname, len(rec["act"]), "steps")
 
     # Close the simulator
     env.close()

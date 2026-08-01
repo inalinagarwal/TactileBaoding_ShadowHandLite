@@ -6,24 +6,29 @@ Observation contract (prop only, no tactile):
   - prop = [pos_norm(13), vel_norm(13), cmd_error(13), last_action(13)]
   - 13 actions; FFJ2/MFJ2/RFJ2 are combined-curl proxies (same coupling as deploy_policy_new)
 
-No FSR serial, no BioTac. Does not modify deploy_policy_new.py.
+pos_err source (flag):
+  USE_MLP_POS_ERR = False  -> last_command - q  (original / policy-calculated)
+  USE_MLP_POS_ERR = True   -> soft-sim pos_err from pos_error_mlp.pt
+                              (plant still uses SPEED_FRAC slew if set; obs error is not slewed)
+
+No FSR serial, no BioTac. Does not modify other deploy scripts.
 
 Laptop:
-  1. Copy this file + best_agent_legacy_new_coup_prop_only.pt
-  2. Set CHECKPOINT path below
-  3. python deploy_prop_only.py
+  1. Copy this file + checkpoint + (if MLP) pos_error_mlp.pt
+  2. Set CHECKPOINT / USE_MLP_POS_ERR below, or:
+       python deploy_prop_only.py
+       python deploy_prop_only.py --mlp-pos-err
+       python deploy_prop_only.py --no-mlp-pos-err
+  3. Place balls, Enter.
 """
 
 from __future__ import print_function
 
-import rospy
+import argparse
 import torch
 import torch.nn as nn
 import numpy as np
 from collections import deque
-
-from sensor_msgs.msg import JointState
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 # ============================================================
 # MODEL — prop-only (encoder first layer in_features = 208)
@@ -33,10 +38,20 @@ PROP_DIM = 52
 NUM_J = 13
 OBS_STACK = 4
 CONTROL_HZ = 60
+MLP_HIST = 4
+MLP_IN_DIM = 169  # pos4 + vel4 + act4 + cur_action
 
+# Prop-only (208-d) checkpoints only. NOTE: best_agent_mass_diff_best.pt is 304-d
+# (tactile) — it will fail the OBS_DIM check here; use a tactile deploy for that.
 CHECKPOINT = "/home/user/experiments/best_agent_legacy_new_coup_prop_only.pt"
+# Also 208-d: best_agent_new_coup_prop_only.pt
+
+POS_ERR_MLP_PATH = "pos_error_mlp.pt"
 OUT_LOG = "hw_policy_log_prop_only.npz"
-SPEED_FRAC = None
+SPEED_FRAC = None  # e.g. 0.5 to slew plant; None = full-speed publish
+
+# Default: policy-calculated pos_err (last_command - q). Override with --mlp-pos-err.
+USE_MLP_POS_ERR = False
 
 
 class Encoder(nn.Module):
@@ -63,6 +78,42 @@ class Policy(nn.Module):
 
     def forward(self, z):
         return self.policy_net(z)
+
+
+class PosErrorMLP(nn.Module):
+    """Soft-sim joint_pos_error from pos_error_mlp.pt (169 -> 13)."""
+
+    def __init__(self, ckpt):
+        super(PosErrorMLP, self).__init__()
+        assert int(ckpt["input_dim"]) == MLP_IN_DIM
+        assert int(ckpt["target_dim"]) == NUM_J
+        self.net = nn.Sequential(
+            nn.Linear(MLP_IN_DIM, 256), nn.LayerNorm(256), nn.ELU(),
+            nn.Linear(256, 256), nn.LayerNorm(256), nn.ELU(),
+            nn.Linear(256, 128), nn.LayerNorm(128),
+        )
+        self.head = nn.Linear(128, NUM_J)
+        self.load_state_dict(ckpt["state_dict"], strict=True)
+        self.register_buffer(
+            "x_mean", torch.tensor(np.asarray(ckpt["x_mean"]), dtype=torch.float32)
+        )
+        self.register_buffer(
+            "x_std", torch.tensor(np.asarray(ckpt["x_std"]), dtype=torch.float32)
+        )
+        self.register_buffer(
+            "y_mean", torch.tensor(np.asarray(ckpt["y_mean"]), dtype=torch.float32)
+        )
+        self.register_buffer(
+            "y_std", torch.tensor(np.asarray(ckpt["y_std"]), dtype=torch.float32)
+        )
+        self.control_names = list(ckpt["control_names"])
+
+    def forward(self, x):
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        xn = (x - self.x_mean) / (self.x_std + 1e-8)
+        y = self.head(self.net(xn))
+        return y * self.y_std + self.y_mean
 
 
 POLICY_JOINTS = [
@@ -168,12 +219,53 @@ def action_to_publish(action, meas_j2, prev_pub):
     return pub.astype(np.float32), raw_cmd, j2_cmd
 
 
+def _torch_load(path):
+    """Old laptop torch has no weights_only=; new torch defaults to True."""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def load_pos_err_mlp(path):
+    ckpt = _torch_load(path)
+    mlp = PosErrorMLP(ckpt)
+    mlp.eval()
+    if mlp.control_names != POLICY_JOINTS:
+        raise RuntimeError(
+            "MLP control_names %s != POLICY_JOINTS %s"
+            % (mlp.control_names, POLICY_JOINTS)
+        )
+    return mlp
+
+
+def predict_pos_err(mlp, pos_hist, vel_hist, act4, cur_action):
+    """Alignment C: pos/vel ending at current; act4 before cur; cur = last action."""
+    x = np.concatenate(
+        [
+            np.concatenate(list(pos_hist), axis=0),
+            np.concatenate(list(vel_hist), axis=0),
+            np.concatenate(list(act4), axis=0),
+            cur_action.astype(np.float32),
+        ]
+    ).astype(np.float32)
+    with torch.no_grad():
+        y = mlp(torch.from_numpy(x)).numpy()[0].astype(np.float32)
+    return y
+
+
 current_joint_pos = np.zeros(NUM_J, dtype=np.float32)
 current_joint_vel = np.zeros(NUM_J, dtype=np.float32)
 last_action = np.zeros(NUM_J, dtype=np.float32)
 last_command = np.zeros(NUM_J, dtype=np.float32)
 joint_ready = False
 prop_buffer = deque(maxlen=OBS_STACK)
+
+# MLP history (only used when USE_MLP_POS_ERR)
+pos_hist = deque(maxlen=MLP_HIST)
+vel_hist = deque(maxlen=MLP_HIST)
+act4 = deque(maxlen=MLP_HIST)
+pos_err_mlp = None
 
 
 def joint_callback(msg):
@@ -189,25 +281,84 @@ def joint_callback(msg):
 
 
 def build_prop():
+    """Policy-calculated pos_err: last_command - q."""
     pos_norm = unscale(current_joint_pos, JOINT_LOWER, JOINT_UPPER)
     vel_norm = current_joint_vel / JOINT_VEL_LIMIT
     error = last_command - current_joint_pos
     return np.concatenate([pos_norm, vel_norm, error, last_action]).astype(np.float32)
 
 
+def build_prop_mlp():
+    """MLP-synthesised soft-sim pos_err (not slewed; plant slew is separate)."""
+    pos_norm = unscale(current_joint_pos, JOINT_LOWER, JOINT_UPPER)
+    vel_norm = current_joint_vel / JOINT_VEL_LIMIT
+    if len(pos_hist) == MLP_HIST:
+        pos_hist.append(pos_norm.copy())
+        vel_hist.append(vel_norm.copy())
+    else:
+        while len(pos_hist) < MLP_HIST:
+            pos_hist.append(pos_norm.copy())
+            vel_hist.append(vel_norm.copy())
+    while len(act4) < MLP_HIST:
+        act4.append(np.zeros(NUM_J, dtype=np.float32))
+    pred_err = predict_pos_err(pos_err_mlp, pos_hist, vel_hist, act4, last_action)
+    prop = np.concatenate([pos_norm, vel_norm, pred_err, last_action]).astype(np.float32)
+    return prop, pred_err
+
+
 def main():
-    global last_action, last_command
+    global last_action, last_command, pos_err_mlp, USE_MLP_POS_ERR, CHECKPOINT
+    global OUT_LOG, POS_ERR_MLP_PATH, SPEED_FRAC
+
+    parser = argparse.ArgumentParser(description="Prop-only deploy (+ optional MLP pos_err)")
+    parser.add_argument(
+        "--mlp-pos-err",
+        dest="mlp_pos_err",
+        action="store_true",
+        default=None,
+        help="Use pos_error_mlp.pt for obs pos_err (overrides USE_MLP_POS_ERR=False)",
+    )
+    parser.add_argument(
+        "--no-mlp-pos-err",
+        dest="mlp_pos_err",
+        action="store_false",
+        help="Use last_command - q for pos_err (default if flag unset)",
+    )
+    parser.add_argument("--checkpoint", default=None, help="Override CHECKPOINT path")
+    parser.add_argument("--mlp", default=None, help="Override POS_ERR_MLP_PATH")
+    parser.add_argument("--out", default=None, help="Override OUT_LOG npz path")
+    parser.add_argument(
+        "--speed-frac",
+        type=float,
+        default=None,
+        help="Optional plant slew fraction (e.g. 0.5). Default: SPEED_FRAC in file.",
+    )
+    args = parser.parse_args()
+
+    if args.mlp_pos_err is not None:
+        USE_MLP_POS_ERR = bool(args.mlp_pos_err)
+    if args.checkpoint:
+        CHECKPOINT = args.checkpoint
+    if args.mlp:
+        POS_ERR_MLP_PATH = args.mlp
+    if args.out:
+        OUT_LOG = args.out
+    if args.speed_frac is not None:
+        SPEED_FRAC = float(args.speed_frac)
+
+    import rospy
+    from sensor_msgs.msg import JointState
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
     rospy.init_node("deploy_prop_only")
     pub = rospy.Publisher("/rh_trajectory_controller/command", JointTrajectory, queue_size=1)
     rospy.Subscriber("/joint_states", JointState, joint_callback)
 
     rospy.loginfo("Loading prop-only checkpoint: %s", CHECKPOINT)
-    ckpt = torch.load(CHECKPOINT, map_location="cpu")
+    ckpt = _torch_load(CHECKPOINT)
     encoder, policy = Encoder(), Policy()
     e_res = encoder.load_state_dict(ckpt["encoder"], strict=False)
     rospy.loginfo("encoder load missing=%s unexpected=%s", e_res.missing_keys, e_res.unexpected_keys)
-    # First linear must be 208-d
     w0 = ckpt["encoder"]["net.0.weight"]
     if tuple(w0.shape) != (1024, OBS_DIM):
         raise RuntimeError(
@@ -221,16 +372,32 @@ def main():
     encoder.eval()
     policy.eval()
 
+    if USE_MLP_POS_ERR:
+        rospy.loginfo("pos_err mode=MLP  loading %s", POS_ERR_MLP_PATH)
+        pos_err_mlp = load_pos_err_mlp(POS_ERR_MLP_PATH)
+    else:
+        rospy.loginfo("pos_err mode=policy (last_command - q)")
+
     rospy.loginfo("Waiting for /joint_states ...")
     while not joint_ready and not rospy.is_shutdown():
         rospy.sleep(0.1)
-    rospy.loginfo("Joint states received. Prop-only OBS_DIM=%d (no FSR/BioTac).", OBS_DIM)
+    rospy.loginfo(
+        "Joint states OK. OBS_DIM=%d | USE_MLP_POS_ERR=%s | SPEED_FRAC=%s",
+        OBS_DIM, USE_MLP_POS_ERR, SPEED_FRAC,
+    )
 
     input("Place balls (optional), then press Enter to start prop-only policy...")
 
     last_command[:] = current_joint_pos
     last_action[:] = 0.0
-    p0 = build_prop()
+    pos_hist.clear()
+    vel_hist.clear()
+    act4.clear()
+
+    if USE_MLP_POS_ERR:
+        p0, _ = build_prop_mlp()
+    else:
+        p0 = build_prop()
     prop_buffer.clear()
     for _ in range(OBS_STACK):
         prop_buffer.append(p0.copy())
@@ -238,11 +405,17 @@ def main():
     rospy.sleep(1.0)
     rate = rospy.Rate(CONTROL_HZ)
     prev_pub = None
-    rec = {"t": [], "q": [], "cmd": [], "act": []}
+    rec = {"t": [], "q": [], "cmd": [], "act": [], "pred_pos_err": []}
 
     try:
         while not rospy.is_shutdown():
-            prop_buffer.append(build_prop())
+            if USE_MLP_POS_ERR:
+                prop, pred_err = build_prop_mlp()
+            else:
+                prop = build_prop()
+                pred_err = None
+
+            prop_buffer.append(prop)
             obs = np.concatenate(list(prop_buffer))
             assert obs.shape[0] == OBS_DIM, obs.shape
             obs_t = torch.from_numpy(obs).unsqueeze(0)
@@ -267,14 +440,27 @@ def main():
             rec["q"].append(current_joint_pos.copy())
             rec["cmd"].append(pub_target.copy())
             rec["act"].append(action.copy())
+            if pred_err is not None:
+                rec["pred_pos_err"].append(pred_err.copy())
 
+            if USE_MLP_POS_ERR:
+                act4.append(last_action.copy())
             last_action[:] = action
+            # Always keep last_command updated (used when USE_MLP_POS_ERR=False)
             last_command[:] = raw_cmd
             last_command[CURL_J2_IDX] = j2_cmd
             rate.sleep()
     finally:
         if rec["t"]:
-            np.savez(OUT_LOG, **dict((k, np.array(v)) for k, v in rec.items()))
+            payload = dict((k, np.array(v)) for k, v in rec.items() if v)
+            payload["use_mlp_pos_err"] = bool(USE_MLP_POS_ERR)
+            payload["checkpoint"] = CHECKPOINT
+            payload["speed_frac"] = np.float32(
+                SPEED_FRAC if SPEED_FRAC is not None else -1.0
+            )
+            if USE_MLP_POS_ERR:
+                payload["pos_err_mlp"] = POS_ERR_MLP_PATH
+            np.savez(OUT_LOG, **payload)
             rospy.loginfo("saved %s: %d steps", OUT_LOG, len(rec["t"]))
 
 

@@ -368,6 +368,11 @@ class BaodingShadowLitePadTacBTCfg(BaodingShadowLitePadTacCfg):
     Identical task/ball setup to BaodingShadowLitePadTacCfg; only the robot asset
     (shadow_padtac_biotac.usd) and the contact-sensor prim path change so the 4
     BioTac distal tips are sensed alongside the 12 pads.
+
+    Command slew (HW SPEED_FRAC) is opt-in via ShadowLiteEnvCfg:
+      cmd_speed_frac=0.5                    # fixed
+      cmd_speed_frac_range=(0.3, 1.0)        # DR (leave cmd_speed_frac=None)
+    Default both None = classic Trial-15/27 plant (no slew).
     """
 
     robot_cfg: ArticulationCfg = (
@@ -376,6 +381,10 @@ class BaodingShadowLitePadTacBTCfg(BaodingShadowLitePadTacCfg):
     robot_contact_sensor_cfg = (
         ShadowLitePadTacBTEnvCfg.__dataclass_fields__["robot_contact_sensor_cfg"].default_factory()
     )
+
+    # Opt-in matched cmd slew / DR (inherited defaults are None = off).
+    # Uncomment for overnight matched-slew scratch:
+    cmd_speed_frac_range = (0.3, 1.0)
 
 
 @configclass

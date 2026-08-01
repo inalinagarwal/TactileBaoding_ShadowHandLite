@@ -1,23 +1,56 @@
 #!/usr/bin/env python
-"""Trial 15 deploy with empty-motion tactile warmup (Gate B style).
+"""Trial 15 deploy — J2 90↔100 remap + SPEED_FRAC ramp (NEW FILE ONLY).
 
-Flow (HAND EMPTY until Phase C):
+This is a standalone experiment script. It does not edit deploy_warmup_trial15.py
+or any other deploy code.
+
+================================================================================
+WHAT THIS FILE CHANGES vs plain trial15 warmup deploy
+================================================================================
+1) USE_J2_90_100_REMAP (flag) — linear J2 sim 100° ↔ HW 90°
+   - Policy / sim think FFJ2/MFJ2/RFJ2 live in [0, J2_UPPER_SIM] ≈ 100° (1.745 rad).
+   - Shadow Hand Lite plant only accepts [0, J2_UPPER_HW] ≈ 90° (1.571 rad).
+   - True:  PUBLISH j2_hw = j2_sim * (90/100);
+            OBS/ENC j2_sim = j2_hw * (100/90) so pos / last_command / pos_err
+            share sim-radian space; gate uses remapped measured J2.
+   - False: no compress/expand (legacy trial15 path for J2 radians).
+
+2) CLIP_TO_PUB_LIMITS (flag) — extra plant clip after pack/(optional remap)
+   - True  (default): np.clip(pub, PUB_LOWER, PUB_UPPER) before PD (legacy HW).
+   - False: skip that second clip; affined+coupled(+optional J2-compress) cmd
+     goes to PD more like sim (sim has no extra plant clip after scale/coupling).
+   - With remap on, J2 is already ≤~90° after compress, so False mainly drops
+     a safety net; ROS may still reject out-of-range targets — log cmd vs q.
+
+3) SPEED_FRAC governor (flag) — pick mode at top of file
+   Not a queue: every 60 Hz tick the policy still runs fresh; we only limit
+   how far pub may step toward the new desire from prev_pub.
+   - USE_SPEED_FRAC_RAMP = False → constant SPEED_FRAC (float or None).
+     Examples: 0.5 (half rated speed), 1.0 (full rated), None (bang-bang).
+   - USE_SPEED_FRAC_RAMP = True  → time schedule:
+       Stage 0  (steps 0 .. RAMP_START-1):     SPEED_FRAC = 0.2  (slow start)
+       Stage 1  (RAMP_START .. RAMP_END-1):     linear ramp 0.2 → 1.0
+       Stage 2  (RAMP_END .. UNLIMITED_AT-1):   SPEED_FRAC = 1.0  (rated-speed cap)
+       Stage 3  (step >= UNLIMITED_AT):          SPEED_FRAC = None (true bang-bang)
+
+Note on tactile: empty-motion thresholds are frozen after warmup. If a pad's ADC
+baseline drifts up after contact, hysteresis can stick ON (raw never falls below
+lo). That is a separate sim↔HW gap from the joint flags above.
+
+================================================================================
+Flow (HAND EMPTY until Phase C) — same Gate-B warmup as trial15
+================================================================================
   A) Replay Trial-15 sim achieved-q  WARMUP_REPEATS times @ 60 Hz.
      Log raw FSR (12) + BioTac PDC (5) every step.
+     (Warmup open-loop still clips q to PUB_UPPER; no J2 expand on replay.)
   B) Fit per-channel thresholds from empty-motion envelope:
         hi = p99.5(raw) + 5 ADC
         lo = median + 2 (narrow pads) or hi - HYST_BAND_WIDE (wide envelopes)
      Hysteresis ON/OFF. mfprox live (FSR_MUTE_MUX empty after pad replace).
-     Save hw_warmup_trial15_fsr.npz for offline plots / sim comparison.
-  C) Move to sim rollout start pose q[0], prompt to place balls in the cup.
-  D) Closed-loop policy with REAL tactile @ SPEED_FRAC=0.5.
-     Save hw_policy_log_trial15_warmupcal.npz.
-
-Encoder check: on load, rospy logs missing/unexpected keys. You want
-  encoder missing=[] unexpected=[]
-If any net.* weights are missing, the encoder is partial — do not deploy.
-
-Does NOT modify deploy_policy_new.py.
+     Save WARMUP_NPZ for offline plots / sim comparison.
+  C) Prompt to place balls in the cup.
+  D) Closed-loop policy with REAL tactile + optional J2 remap / CLIP /
+     SPEED_FRAC (ramp or fixed). Save POLICY_NPZ (includes per-step speed_frac).
 
 Laptop files needed next to this script (or absolute paths below):
   sim_policy_log_trial15_seed42.npz
@@ -39,8 +72,6 @@ from sr_robot_msgs.msg import BiotacAll
 import serial
 import threading
 
-from fsr_pad_map import FSR_CHANNELS, FSR_NAMES
-
 # ============================================================
 # PATHS / PROTOCOL
 # ============================================================
@@ -48,18 +79,35 @@ REPLAY_Q_FILE = "sim_policy_log_trial15_seed42.npz"  # must have q (T,16) + join
 CHECKPOINT = "/home/user/experiments/best_agent_legacy_padtac_bt_scratch_trial15.pt"
 
 WARMUP_REPEATS = 5
-WARMUP_NPZ = "hw_warmup_trial15_fsr.npz"
-POLICY_NPZ = "hw_policy_log_trial15_warmupcal.npz"
+WARMUP_NPZ = "hw_warmup_trial15_j2remap_ramp_fsr.npz"
+POLICY_NPZ = "hw_policy_log_trial15_j2remap_ramp.npz"
 
 CONTROL_HZ = 60
-SPEED_FRAC = 0.5  # half-speed rate governor (successful HW setting)
 
-# --- pos_err ablation (default off) ---
-# False (default): last_command = unslewed sim joint_pos_cmd (raw_cmd / j2_cmd).
-#   With SPEED_FRAC, plant tracks slewed pub but obs sees raw−q → artificial lag.
-# True: last_command = 13-d equivalent of published pub_target (after slew).
-#   pos_err ≈ 0 on stiff HW; tests whether bang-bang / velocity dominates over error.
-USE_PUBLISHED_CMD_FOR_POS_ERR = False
+# ----- Experiment flags (policy phase) -----
+# J2 90↔100 linear remap (publish compress + obs/gate expand).
+USE_J2_90_100_REMAP = True
+
+# After affine + coupling + optional J2 compress, optionally clip 16-d pub to PUB_*.
+# True  = legacy HW second clip (safety net).
+# False = skip it — closer to sim PD path (no extra clip after scale/coupling).
+CLIP_TO_PUB_LIMITS = True
+
+# SPEED_FRAC: fraction of PUB_VEL_LIMIT as max |Δcmd| per tick.
+# None = no governor (pub may jump fully to desire after optional clip).
+#   USE_SPEED_FRAC_RAMP = True  → use the ramp schedule below
+#   USE_SPEED_FRAC_RAMP = False → use fixed SPEED_FRAC for the whole run
+USE_SPEED_FRAC_RAMP = True
+SPEED_FRAC = 0.5   # used only when USE_SPEED_FRAC_RAMP is False
+                   # try: 0.5  |  1.0  |  None
+
+# Ramp schedule (used only when USE_SPEED_FRAC_RAMP is True)
+# Units: control steps @ CONTROL_HZ (60 Hz → 60 steps = 1 s).
+SPEED_FRAC_START = 0.2          # Stage 0: cautious start
+SPEED_FRAC_PEAK = 1.0           # Stage 1→2: ramp up to rated-speed cap
+RAMP_START_STEP = 5 * CONTROL_HZ   # 5 s at START, then begin ramp
+RAMP_END_STEP = 20 * CONTROL_HZ    # finish ramp by 20 s (15 s linear ramp)
+UNLIMITED_AT_STEP = 40 * CONTROL_HZ  # after 40 s: SPEED_FRAC = None
 
 # Empty-motion envelope thresholds (not K*std — std blows up on spike pads):
 #   hi = percentile(warmup, P_HI) + MARGIN_ABS
@@ -182,9 +230,24 @@ PUB_VEL_LIMIT = np.array(
     dtype=np.float32,
 )
 
-# Mux -> sim ch map: fsr_pad_map.py (wire-checked; matches shadow_padtac.usd).
-# Force these mux indices silent in the policy tactile vector (always 0).
+# ----- J2 sim↔HW linear remap (FFJ2 / MFJ2 / RFJ2 only) -----
+# Sim / policy J2 upper (JOINT_UPPER[8:11], coupling math): ~100°
+# Hardware publish upper (PUB_UPPER[8:10]):                ~90°
+J2_UPPER_HW = 1.5708  # 90°  — plant / PUB clip
+# J2_UPPER_SIM already defined above (= 1.7450 ≈ 100°)
+J2_SIM_TO_HW = J2_UPPER_HW / J2_UPPER_SIM   # compress before publish (~0.9)
+J2_HW_TO_SIM = J2_UPPER_SIM / J2_UPPER_HW   # expand measured J2 for obs (~1.111)
+
+# Mux C0..C11 -> 24-d channel (wire-checked map)
+FSR_CHANNELS = [10, 7, 4, 9, 5, 13, 2, 3, 8, 18, 12, 11]
+FSR_NAMES = [
+    "C0_thprox", "C1_ffprox", "C2_mfknuckle", "C3_rfprox",
+    "C4_rfknuckle", "C5_rfmid", "C6_palm", "C7_ffknuckle",
+    "C8_mfprox", "C9_thmiddle", "C10_mfmid", "C11_ffmid",
+]
 N_FSR = 12
+# Force these mux indices silent in the policy tactile vector (always 0).
+# mfprox replaced — leave empty unless a channel is clearly broken again.
 FSR_MUTE_MUX = []
 BIOTAC_IDX = [0, 1, 2, 4]
 BIOTAC_CH = [15, 16, 17, 22]
@@ -204,7 +267,70 @@ def scale(a, lo, hi):
     return 0.5 * (a + 1.0) * (hi - lo) + lo
 
 
-def action_to_publish(action, meas_j2, prev_pub):
+def j2_sim_to_hw(j2_sim):
+    """Compress sim-space J2 (0..100°) → HW publish space (0..90°) if remap on."""
+    x = np.asarray(j2_sim, dtype=np.float32)
+    if not USE_J2_90_100_REMAP:
+        return x
+    return x * J2_SIM_TO_HW
+
+
+def j2_hw_to_sim(j2_hw):
+    """Expand HW-measured J2 (0..90°) → sim / policy space (0..100°) if remap on."""
+    x = np.asarray(j2_hw, dtype=np.float32)
+    if not USE_J2_90_100_REMAP:
+        return x
+    return x * J2_HW_TO_SIM
+
+
+def joint_pos_sim():
+    """13-d policy joint positions; J2 remapped into sim radians when flag on."""
+    pos = current_joint_pos.copy()
+    if USE_J2_90_100_REMAP:
+        pos[CURL_J2_IDX] = j2_hw_to_sim(pos[CURL_J2_IDX])
+    return pos
+
+
+def speed_frac_at_step(step):
+    """Return SPEED_FRAC for this policy tick (float or None).
+
+    If USE_SPEED_FRAC_RAMP is False: always return fixed SPEED_FRAC.
+    If True:
+      Stage 0: hold SPEED_FRAC_START
+      Stage 1: linear ramp START → PEAK over [RAMP_START_STEP, RAMP_END_STEP)
+      Stage 2: hold SPEED_FRAC_PEAK
+      Stage 3: None (unlimited) once step >= UNLIMITED_AT_STEP
+    """
+    if not USE_SPEED_FRAC_RAMP:
+        return None if SPEED_FRAC is None else float(SPEED_FRAC)
+
+    if step >= UNLIMITED_AT_STEP:
+        return None  # Stage 3 — true no governor
+    if step < RAMP_START_STEP:
+        return float(SPEED_FRAC_START)  # Stage 0
+    if step < RAMP_END_STEP:
+        # Stage 1 — linear interpolate
+        alpha = float(step - RAMP_START_STEP) / float(RAMP_END_STEP - RAMP_START_STEP)
+        return float(SPEED_FRAC_START + alpha * (SPEED_FRAC_PEAK - SPEED_FRAC_START))
+    return float(SPEED_FRAC_PEAK)  # Stage 2
+
+
+def action_to_publish(action, meas_j2_sim, prev_pub, speed_frac):
+    """Policy action → 16-d HW trajectory target.
+
+    Stages inside this call:
+      1) Unscale action → raw 13-d cmd in sim joint limits (incl. J2 up to 100°).
+      2) Coupling: proxy J2 → (j2_cmd, j1_cmd) in sim space; gate with meas_j2_sim.
+      3) Pack 16-d pub; optional COMPRESS J2 slots sim→HW (USE_J2_90_100_REMAP).
+      4) Optional CLIP_TO_PUB_LIMITS: np.clip to PUB_LOWER/UPPER (extra plant clip).
+      5) Optional slew governor: step toward desire by at most
+         PUB_VEL_LIMIT * speed_frac / CONTROL_HZ  (skipped if speed_frac is None).
+    Returns:
+      pub     — what we send to the robot (HW radians)
+      raw_cmd — 13-d sim-space desire (for last_command non-J2)
+      j2_cmd  — 3-d sim-space J2 desire (for last_command J2; pre-compress)
+    """
+    # --- Stage 1: action → sim joint cmd ---
     raw_cmd = scale(action, JOINT_LOWER, JOINT_UPPER)
     proxy = raw_cmd[CURL_J2_IDX]
     j2_cmd = np.clip(proxy * (J2_UPPER_SIM / COUPLING_THETA), 0.0, J2_UPPER_SIM)
@@ -212,61 +338,27 @@ def action_to_publish(action, meas_j2, prev_pub):
         (proxy - COUPLING_THETA) / (J2_UPPER_SIM - COUPLING_THETA) * J1_UPPER_SIM,
         0.0, J1_UPPER_SIM,
     )
+    # --- Stage 2: underactuated J1 gate (meas_j2 in same space as opens_at) ---
     opens_at = J2_UPPER_SIM - GATE_J2_TOL
-    gate = np.clip((np.asarray(meas_j2, dtype=np.float32) - opens_at) / GATE_J2_TOL, 0.0, 1.0)
+    gate = np.clip((np.asarray(meas_j2_sim, dtype=np.float32) - opens_at) / GATE_J2_TOL, 0.0, 1.0)
     j1_cmd = j1_cmd * gate
 
+    # --- Stage 3: pack (+ optional J2 compress sim→HW) ---
     pub = np.empty(16, dtype=np.float32)
     pub[PUB_NONCOUPLED] = raw_cmd[CTRL_NONCOUPLED]
-    pub[PUB_J2_SLOTS] = j2_cmd
+    pub[PUB_J2_SLOTS] = j2_sim_to_hw(j2_cmd)  # identity if remap off
     pub[PUB_J1_SLOTS] = j1_cmd
-    pub = np.clip(pub, PUB_LOWER, PUB_UPPER)
 
-    if prev_pub is not None and SPEED_FRAC is not None:
-        max_delta = PUB_VEL_LIMIT * SPEED_FRAC / CONTROL_HZ
+    # --- Stage 4: optional extra plant clip (sim has no equivalent) ---
+    if CLIP_TO_PUB_LIMITS:
+        pub = np.clip(pub, PUB_LOWER, PUB_UPPER)
+
+    # --- Stage 5: slew governor on published cmd ---
+    if prev_pub is not None and speed_frac is not None:
+        max_delta = PUB_VEL_LIMIT * float(speed_frac) / CONTROL_HZ
         pub = prev_pub + np.clip(pub - prev_pub, -max_delta, max_delta)
 
     return pub.astype(np.float32), raw_cmd, j2_cmd
-
-
-def pub16_to_cmd13(pub):
-    """Map published 16-d joint targets back to 13-d policy cmd_error space."""
-    cmd = np.empty(NUM_J, dtype=np.float32)
-    cmd[CTRL_NONCOUPLED] = pub[PUB_NONCOUPLED]
-    cmd[CURL_J2_IDX] = pub[PUB_J2_SLOTS]
-    return cmd
-
-
-def verify_encoder_load(load_result, checkpoint_path):
-    """Log whether the encoder checkpoint loaded completely (not partial).
-
-    On the control laptop, after ``rospy.init_node``, look for::
-
-        [INFO] Encoder load OK: all weights present ...
-
-    If you see ``ENCODER INCOMPLETE`` or missing ``net.*`` keys, stop — you would
-    be running a random or partial encoder.  Policy head uses strict=True separately.
-    """
-    missing = list(load_result.missing_keys)
-    unexpected = list(load_result.unexpected_keys)
-    weight_missing = [k for k in missing if k.startswith("net.")]
-    if weight_missing:
-        rospy.logerr(
-            "ENCODER INCOMPLETE — missing weight keys: %s  (checkpoint: %s)",
-            weight_missing, checkpoint_path,
-        )
-    elif missing:
-        rospy.logwarn(
-            "Encoder missing_keys (non-weight; verify harmless): %s", missing,
-        )
-    else:
-        rospy.loginfo(
-            "Encoder load OK: all weights present (not partial). checkpoint=%s",
-            checkpoint_path,
-        )
-    if unexpected:
-        rospy.logwarn("Encoder unexpected_keys: %s", unexpected)
-    return not weight_missing
 
 
 # ============================================================
@@ -456,9 +548,14 @@ def read_tactile():
 
 
 def build_prop():
-    pos_norm = unscale(current_joint_pos, JOINT_LOWER, JOINT_UPPER)
-    vel_norm = current_joint_vel / JOINT_VEL_LIMIT
-    error = last_command - current_joint_pos
+    """52-d proprio; J2 HW→sim only when USE_J2_90_100_REMAP."""
+    pos_sim = joint_pos_sim()
+    pos_norm = unscale(pos_sim, JOINT_LOWER, JOINT_UPPER)
+    vel = current_joint_vel.copy()
+    if USE_J2_90_100_REMAP:
+        vel[CURL_J2_IDX] = vel[CURL_J2_IDX] * J2_HW_TO_SIM
+    vel_norm = vel / JOINT_VEL_LIMIT
+    error = last_command - pos_sim
     return np.concatenate([pos_norm, vel_norm, error, last_action]).astype(np.float32)
 
 
@@ -485,7 +582,7 @@ def run_q_replay(pub, rec_q, episode_id, log):
 def main():
     global last_action, last_command, fsr_state, bt_state
 
-    rospy.init_node("deploy_warmup_trial15")
+    rospy.init_node("deploy_warmup_trial15_j2remap_ramp")
     pub = rospy.Publisher("/rh_trajectory_controller/command", JointTrajectory, queue_size=1)
     rospy.Subscriber("/joint_states", JointState, joint_callback)
     rospy.Subscriber("/rh/tactile", BiotacAll, biotac_cb, queue_size=1)
@@ -598,7 +695,17 @@ def main():
         joints=PUBLISH_JOINTS,
         replay_file=REPLAY_Q_FILE,
         warmup_repeats=np.int32(WARMUP_REPEATS),
-        speed_frac=np.float32(SPEED_FRAC if SPEED_FRAC is not None else -1.0),
+        speed_frac=np.float32(
+            -1.0 if USE_SPEED_FRAC_RAMP else (-1.0 if SPEED_FRAC is None else SPEED_FRAC)
+        ),
+        use_speed_frac_ramp=np.bool_(USE_SPEED_FRAC_RAMP),
+        clip_to_pub_limits=np.bool_(CLIP_TO_PUB_LIMITS),
+        use_j2_90_100_remap=np.bool_(USE_J2_90_100_REMAP),
+        j2_upper_sim=np.float32(J2_UPPER_SIM),
+        j2_upper_hw=np.float32(J2_UPPER_HW),
+        note=np.array(
+            "warmup open-loop unchanged; flags: J2 remap, CLIP_TO_PUB_LIMITS, SPEED_FRAC"
+        ),
     )
     rospy.loginfo("Saved warmup sensors -> %s  (%d steps)", WARMUP_NPZ, len(fsr_arr))
     rospy.loginfo("Empty-motion binary ON%% (should be low):")
@@ -611,25 +718,17 @@ def main():
                       name, 100.0 * tac_warmup[:, BIOTAC_CH[k]].mean(),
                       bt_baseline[k], bt_hi[k])
 
-    # Move to sim rollout START (q[0]), not end-of-replay pose — matches closed-loop IC.
-    policy_start_q = np.clip(rec_q[0], PUB_LOWER, PUB_UPPER)
-    rospy.loginfo(
-        "Warmup done. Moving to sim q[0] (policy start pose) from %s ...",
-        REPLAY_Q_FILE,
-    )
-    publish_target(pub, policy_start_q, 2.0)
-    rospy.sleep(3.0)
+    # Hold last warmup pose while user places balls
+    if warmup["cmd"]:
+        publish_target(pub, np.asarray(warmup["cmd"][-1], dtype=np.float32), 1.0)
 
-    input(
-        "At sim q[0]. PLACE BALLS in cup, then press Enter to start POLICY..."
-    )
+    input("Warmup done. PLACE BALLS in cup, then press Enter to start POLICY...")
 
     # ----- load policy -----
     rospy.loginfo("Loading checkpoint: %s", CHECKPOINT)
     ckpt = torch.load(CHECKPOINT, map_location="cpu")
     encoder, policy = Encoder(), Policy()
     e_res = encoder.load_state_dict(ckpt["encoder"], strict=False)
-    verify_encoder_load(e_res, CHECKPOINT)
     rospy.loginfo("encoder missing=%s unexpected=%s", e_res.missing_keys, e_res.unexpected_keys)
     policy.load_state_dict(
         {k: v for k, v in ckpt["policy"].items() if k != "log_std_parameter"},
@@ -640,7 +739,8 @@ def main():
 
     fsr_state[:] = False
     bt_state[:] = False
-    last_command[:] = current_joint_pos
+    # Seed last_command in sim space (J2 expanded) so first pos_err is ~0.
+    last_command[:] = joint_pos_sim()
     last_action[:] = 0.0
     p0, t0 = build_prop(), read_tactile()
     prop_buffer.clear()
@@ -652,47 +752,76 @@ def main():
     rospy.sleep(1.0)
     rate = rospy.Rate(CONTROL_HZ)
     prev_pub = None
-    rec = {"t": [], "q": [], "cmd": [], "tac": [], "fsr": [], "biotac_pdc": [], "act": []}
-    rospy.loginfo(
-        "Policy loop @ %d Hz | motion-calibrated tactile | governor=%s | "
-        "pos_err_from_pub=%s",
-        CONTROL_HZ, SPEED_FRAC, USE_PUBLISHED_CMD_FOR_POS_ERR,
-    )
+    step = 0
+    rec = {
+        "t": [], "q": [], "q_sim": [], "cmd": [], "tac": [],
+        "fsr": [], "biotac_pdc": [], "act": [], "speed_frac": [],
+    }
+    if USE_SPEED_FRAC_RAMP:
+        rospy.loginfo(
+            "Policy @ %d Hz | J2_REMAP=%s | CLIP_TO_PUB=%s | SPEED_FRAC RAMP: "
+            "%.2f for %ds → ramp to %.2f by %ds → hold → None after %ds",
+            CONTROL_HZ, USE_J2_90_100_REMAP, CLIP_TO_PUB_LIMITS,
+            SPEED_FRAC_START, RAMP_START_STEP // CONTROL_HZ,
+            SPEED_FRAC_PEAK, RAMP_END_STEP // CONTROL_HZ,
+            UNLIMITED_AT_STEP // CONTROL_HZ,
+        )
+    else:
+        rospy.loginfo(
+            "Policy @ %d Hz | J2_REMAP=%s | CLIP_TO_PUB=%s | SPEED_FRAC FIXED: %s",
+            CONTROL_HZ, USE_J2_90_100_REMAP, CLIP_TO_PUB_LIMITS,
+            "None (unlimited)" if SPEED_FRAC is None else ("%.3f" % float(SPEED_FRAC)),
+        )
 
     try:
         while not rospy.is_shutdown():
+            # ----- Stage A: build obs (prop uses sim-space J2) -----
             prop_buffer.append(build_prop())
             tactile_buffer.append(read_tactile())
             obs = np.concatenate(list(prop_buffer) + list(tactile_buffer))
             assert obs.shape[0] == OBS_DIM, obs.shape
             obs_t = torch.from_numpy(obs).unsqueeze(0)
 
+            # ----- Stage B: policy forward -----
             with torch.no_grad():
                 action = policy(encoder(obs_t)).numpy()[0].astype(np.float32)
 
+            # ----- Stage C: SPEED_FRAC for this tick (ramp schedule or fixed) -----
+            sf = speed_frac_at_step(step)
+            if USE_SPEED_FRAC_RAMP and step in (
+                0, RAMP_START_STEP, RAMP_END_STEP, UNLIMITED_AT_STEP
+            ):
+                rospy.loginfo(
+                    "SPEED_FRAC stage change @ step=%d (t=%.1fs): %s",
+                    step, step / float(CONTROL_HZ),
+                    "None (unlimited)" if sf is None else ("%.3f" % sf),
+                )
+
+            # ----- Stage D: action → pub (J2 compress + optional slew) -----
+            meas_j2_sim = j2_hw_to_sim(current_joint_pos[CURL_J2_IDX])
             pub_target, raw_cmd, j2_cmd = action_to_publish(
-                action, current_joint_pos[CURL_J2_IDX], prev_pub
+                action, meas_j2_sim, prev_pub, sf
             )
             prev_pub = pub_target
             publish_target(pub, pub_target, 1.0 / CONTROL_HZ)
 
+            # ----- Stage E: log + update encoder memory in sim space -----
             rec["t"].append(rospy.get_time())
-            rec["q"].append(current_joint_pos.copy())
-            rec["cmd"].append(pub_target.copy())
+            rec["q"].append(current_joint_pos.copy())          # raw HW 13-d
+            rec["q_sim"].append(joint_pos_sim())               # remapped for debug
+            rec["cmd"].append(pub_target.copy())               # what plant got
             rec["tac"].append(tactile_buffer[-1].copy())
             with fsr_lock:
                 rec["fsr"].append(latest_fsr.copy())
             with bt_lock:
                 rec["biotac_pdc"].append(latest_biotac_pdc.copy())
             rec["act"].append(action.copy())
+            rec["speed_frac"].append(-1.0 if sf is None else float(sf))
 
             last_action[:] = action
-            if USE_PUBLISHED_CMD_FOR_POS_ERR:
-                # Ablation: cmd_error tracks what the plant actually received (slewed).
-                last_command[:] = pub16_to_cmd13(pub_target)
-            else:
-                last_command[:] = raw_cmd
-                last_command[CURL_J2_IDX] = j2_cmd
+            last_command[:] = raw_cmd
+            last_command[CURL_J2_IDX] = j2_cmd  # sim-space J2 (pre-compress if remap on)
+            step += 1
             rate.sleep()
     finally:
         if rec["t"]:
@@ -706,7 +835,20 @@ def main():
                 bt_hi=bt_hi,
                 bt_lo=bt_lo,
                 warmup_file=WARMUP_NPZ,
-                use_published_cmd_for_pos_err=USE_PUBLISHED_CMD_FOR_POS_ERR,
+                j2_upper_sim=np.float32(J2_UPPER_SIM),
+                j2_upper_hw=np.float32(J2_UPPER_HW),
+                j2_sim_to_hw=np.float32(J2_SIM_TO_HW),
+                use_j2_90_100_remap=np.bool_(USE_J2_90_100_REMAP),
+                use_speed_frac_ramp=np.bool_(USE_SPEED_FRAC_RAMP),
+                clip_to_pub_limits=np.bool_(CLIP_TO_PUB_LIMITS),
+                speed_frac_fixed=np.float32(
+                    -1.0 if SPEED_FRAC is None else float(SPEED_FRAC)
+                ),
+                speed_frac_start=np.float32(SPEED_FRAC_START),
+                speed_frac_peak=np.float32(SPEED_FRAC_PEAK),
+                ramp_start_step=np.int32(RAMP_START_STEP),
+                ramp_end_step=np.int32(RAMP_END_STEP),
+                unlimited_at_step=np.int32(UNLIMITED_AT_STEP),
             )
             rospy.loginfo("saved %s: %d steps", POLICY_NPZ, len(rec["t"]))
 
