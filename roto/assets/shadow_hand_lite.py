@@ -16,6 +16,8 @@ Reference:
 """
 
 
+import os
+
 import isaaclab.sim as sim_utils
 from isaaclab.actuators.actuator_cfg import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
@@ -25,10 +27,10 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 # Configuration
 ##
 
-
+_SHADOW_LITE_ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shadow_lite")
 
 _SHADOW_LITE_SPAWN = sim_utils.UsdFileCfg(
-    usd_path=f"/home/nalin/roto_2/roto/assets/shadow_lite/shadow_touchlab_col.usd",
+    usd_path=os.path.join(_SHADOW_LITE_ASSET_DIR, "shadow_padtac_biotac.usd"),
     activate_contact_sensors=True,
     rigid_props=sim_utils.RigidBodyPropertiesCfg(
         disable_gravity=True,
@@ -85,7 +87,7 @@ _SHADOW_LITE_SPAWN = sim_utils.UsdFileCfg(
 #     #fixed_tendons_props=sim_utils.FixedTendonPropertiesCfg(limit_stiffness=30.0, damping=0.1),
 # )
 _SHADOW_LITE_PADTAC_SPAWN = sim_utils.UsdFileCfg(
-    usd_path=f"/home/nalin/roto_2/roto/assets/shadow_lite/shadow_padtac.usd",
+    usd_path=os.path.join(_SHADOW_LITE_ASSET_DIR, "shadow_padtac_biotac.usd"),
     activate_contact_sensors=True,
     rigid_props=sim_utils.RigidBodyPropertiesCfg(
         disable_gravity=True,
@@ -487,7 +489,7 @@ SHADOW_HAND_LITE_PADTAC_CFG = ArticulationCfg(
 
 
 _SHADOW_LITE_PADTAC_BT_SPAWN = sim_utils.UsdFileCfg(
-    usd_path=f"/home/nalin/roto_2/roto/assets/shadow_lite/shadow_padtac_biotac.usd",
+    usd_path=os.path.join(_SHADOW_LITE_ASSET_DIR, "shadow_padtac_biotac.usd"),
     activate_contact_sensors=True,
     rigid_props=sim_utils.RigidBodyPropertiesCfg(
         disable_gravity=True,

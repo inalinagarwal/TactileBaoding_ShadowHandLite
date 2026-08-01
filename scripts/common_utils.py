@@ -288,6 +288,12 @@ def make_env(agent_cfg, env_cfg, writer, args_cli):
 
     single_obs_space = gym.spaces.Dict()
     single_obs_space["policy"] = gym.spaces.Dict(gym_dict)
+
+    obs_dims = {k: v.shape for k, v in gym_dict.items()}
+    total_obs_dim = sum(int(np.prod(v.shape)) for v in gym_dict.values())
+    print(f"[INFO] Observation shapes: {obs_dims}")
+    print(f"[INFO] Total observation input dim: {total_obs_dim}")
+
     obs_space = gym.vector.utils.batch_space(single_obs_space, env_cfg.scene.num_envs)
     single_action_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(env_cfg.num_actions,))
     action_space = gym.vector.utils.batch_space(single_action_space, env_cfg.scene.num_envs)

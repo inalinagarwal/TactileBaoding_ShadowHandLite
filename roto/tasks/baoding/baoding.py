@@ -291,6 +291,9 @@ class BaodingShadowLiteCfg(BaodingTaskCfg, ShadowLiteEnvCfg):
     # Ball friction DR: one value sampled per env each reset, applied to BOTH balls.
     ball_friction_range: tuple[float, float] = (0.2, 0.6)
 
+    # Ball mass DR (kg): one value sampled per env each reset, applied to BOTH balls.
+    ball_mass_range: tuple[float, float] = (0.045, 0.100)
+
     ball_reset_height = 0.46
 
     ball_mass_g = 55
@@ -338,6 +341,7 @@ class BaodingShadowLitePadTacCfg(BaodingTaskCfg, ShadowLitePadTacEnvCfg):
 
     events: ShadowLiteFrictionEventCfg = ShadowLiteFrictionEventCfg()
     ball_friction_range: tuple[float, float] = (0.2, 0.6)
+    ball_mass_range: tuple[float, float] = (0.045, 0.100)
 
     ball_reset_height = 0.46
     ball_mass_g = 55
@@ -623,6 +627,8 @@ class BaodingMixin:
         self._baoding_reset_balls(env_ids)
         if getattr(self.cfg, "ball_friction_range", None) is not None:
             self._randomize_ball_friction(env_ids)
+        if getattr(self.cfg, "ball_mass_range", None) is not None:
+            self._randomize_ball_mass(env_ids)
 
     def _randomize_ball_friction(self, env_ids: Sequence[int]) -> None:
         """Sample one friction value per env and apply it to BOTH balls (same each reset).
@@ -640,6 +646,28 @@ class BaodingMixin:
             materials[eids, :, 1:2] = mu   # dynamic friction (= static)
             materials[eids, :, 2:3] = 0.0  # restitution
             ball.root_physx_view.set_material_properties(materials, eids)
+
+    def _randomize_ball_mass(self, env_ids: Sequence[int]) -> None:
+        """Sample one mass (kg) per env and apply it to BOTH balls (same each reset).
+
+        Mirrors _randomize_ball_friction: mdp.randomize_rigid_body_mass samples
+        independently per asset_cfg call, so it can't express "same value across two
+        separate RigidObjects" either. Writes the mass buffer directly and rescales
+        inertia by the mass ratio (uniform-density sphere, radius unchanged), matching
+        the recompute done inside mdp.randomize_rigid_body_mass.
+        """
+        lo, hi = self.cfg.ball_mass_range
+        eids = env_ids.cpu()
+        mass = sample_uniform(lo, hi, (len(eids), 1), device="cpu")  # [n_env, 1 body]
+        for ball in (self.ball_1, self.ball_2):
+            masses = ball.root_physx_view.get_masses()  # [N, 1] on CPU
+            ratios = mass / masses[eids]
+            masses[eids] = mass
+            ball.root_physx_view.set_masses(masses, eids)
+
+            inertias = ball.root_physx_view.get_inertias()  # [N, 9] on CPU
+            inertias[eids] = inertias[eids] * ratios
+            ball.root_physx_view.set_inertias(inertias, eids)
 
     def _reset_target_pose(self, reached_goal_ids):
         self.ball_goal_idx[reached_goal_ids] = ~self.ball_goal_idx[reached_goal_ids]

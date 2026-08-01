@@ -81,6 +81,16 @@ class ShadowLiteEnvCfg(RotoEnvCfg):
     reset_joint_pos_noise = 0.1
     reset_joint_vel_noise = 0.0
 
+    # --- Policy I/O noise (sim-to-real). Per-step i.i.d. Gaussian; std is in the
+    # native units of each signal. 0.0 disables (old cfgs stay noise-free). ---
+    # Actuator noise: added to the raw [-1,1] action before scaling to joint cmds,
+    # then stored into self.actions so the policy also sees it in its obs history.
+    action_noise_std: float = 0.02
+    # Proprioception (sensor) noise, per prop sub-vector:
+    obs_noise_std_joint_pos: float = 0.01        # on normalised_joint_pos (~[-1,1])
+    obs_noise_std_joint_vel: float = 0.02        # on normalised_joint_vel (~[-1,1])
+    obs_noise_std_joint_pos_error: float = 0.01  # on joint_pos_error (rad, ~0.6 deg)
+
     tacsl_contact_expr: str | None = "{ENV_REGEX_NS}/ball1"
     """Prim path expression for the TacSL contact object.
     Set to None to disable TacSL and fall back to ContactSensor (e.g. --no_ball mode).
@@ -113,6 +123,11 @@ class ShadowLiteEnvCfg(RotoEnvCfg):
                 "rh_THJ5":  0.4,     # rotate thumb inward ~23°
                 "rh_THJ4":  0.5,     # abduct across palm ~29°
                 "rh_THJ2":  0.35,    # flex ~20°
+                # ── Locked coupled-dependent joints — pinned at 0, see
+                #    lock_coupled_dependent_at_zero below ─────────────────────────
+                "rh_FFJ1":  0.0,
+                "rh_MFJ1":  0.0,
+                "rh_RFJ1":  0.0,
             },
 
         #     joint_pos = {
@@ -188,6 +203,12 @@ class ShadowLiteEnvCfg(RotoEnvCfg):
         "rh_MFJ1": "rh_MFJ2",
         "rh_RFJ1": "rh_RFJ2",
     }
+
+    # Hard-lock the coupled dependent joints (FF/MF/RF J1) at 0 rad: their commanded
+    # position is always zero regardless of the J2-derived coupling law below. J2's
+    # own command/state-machine bookkeeping is untouched, so J2 dynamics stay
+    # identical — only J1's actual motion is disabled.
+    lock_coupled_dependent_at_zero: bool = True
 
     # J2 must reach this angle (rad) before J1 starts moving.
     # 0.785 rad = 45°: first half of J2's range drives J2, second half drives J1.
@@ -431,6 +452,9 @@ class ShadowLitePadTacEnv(ShadowLiteEnv):
 
         tactile = torch.zeros((self.num_envs, NUM_TACTILE_CHANNELS), device=self.device)
         tactile[:, self._pad_channels] = norm[:, self._pad_body_indices]
+
+        if self.tactile_cfg is not None and self.tactile_cfg.get("zero_tactile", False):
+            tactile.zero_()
 
         self.last_tactile = self.tactile
         self.tactile = tactile

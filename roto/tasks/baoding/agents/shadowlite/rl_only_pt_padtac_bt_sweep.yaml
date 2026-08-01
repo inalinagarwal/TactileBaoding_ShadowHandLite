@@ -3,6 +3,14 @@
 # Logs: Baoding_rl_only_pt_padtac_bt_sweep_<study>/
 # Never writes rl_only_pt_padtac, rl_only_pt_padtac_bt_ft, or ft_sweep DBs.
 
+# Prop-only ablation: keep obs_list/tactile_cfg dims identical to the tactile
+# variant (24 taxels, same 304-D obs/network shapes) but zero every tactile
+# value at the source, so the policy sees no tactile signal without touching
+# observation-space sizing anywhere else.
+observations:
+  tactile_cfg:
+    zero_tactile: true
+
 agent:
   rollouts: 32
   learning_epochs: 8
@@ -29,6 +37,6 @@ trainer:
   max_global_timesteps_M: 250
 
 sweeper:
-  storage: sqlite:///shadow_baoding_padtac_bt_scratch.db
+  storage: sqlite:///shadow_baoding_padtac_bt_scratch_2.db
   warmup_timesteps_M: 100
   max_sweep_timesteps_M: 250

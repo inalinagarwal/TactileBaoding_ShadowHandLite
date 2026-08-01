@@ -274,6 +274,14 @@ class RotoEnv(DirectRLEnv):
         self.prev_joint_pos_cmd[:] = self.joint_pos_cmd
         self.actions = actions.clone()  # (num_envs, 13)
 
+        # Actuator noise: perturb the raw [-1,1] action in place. self.actions is
+        # what both drives the joints (scale() below) and is fed back into the
+        # proprioception obs (last-action slot), so the noise is visible to both.
+        a_std = getattr(self.cfg, "action_noise_std", 0.0)
+        if a_std > 0.0:
+            self.actions.add_(torch.randn_like(self.actions) * a_std)
+            self.actions.clamp_(-1.0, 1.0)  # keep within scale()'s expected [-1,1] domain
+
         # 13 actions -> 13 directly controlled joints
         self.joint_pos_cmd[:, self.control_dof_indices] = scale(
             self.actions,
@@ -431,6 +439,9 @@ class RotoEnv(DirectRLEnv):
             )
             j1_cmd = j1_cmd * gate
 
+        if getattr(self.cfg, "lock_coupled_dependent_at_zero", False):
+            j1_cmd = torch.zeros_like(j1_cmd)
+
         self.joint_pos_cmd[:, self.coupled_driver_indices]    = j2_cmd
         self.joint_pos_cmd[:, self.coupled_dependent_indices] = j1_cmd
 
@@ -567,17 +578,27 @@ class RotoEnv(DirectRLEnv):
 
         Returns:
             Concatenated tensor containing normalized joint positions, normalized joint
-            velocities, and actions.
+            velocities, joint position error, and actions. Sensor noise (Gaussian) is
+            optionally added to the position/velocity/error slices — see
+            obs_noise_std_joint_{pos,vel,pos_error} on the env cfg.
         """
-        prop = torch.cat(
-            (
-                self.normalised_joint_pos[:, self.prop_dof_indices],
-                self.normalised_joint_vel[:, self.prop_dof_indices],
-                self.joint_pos_error[:, self.prop_dof_indices],
-                self.actions,
-            ),
-            dim=-1,
-        )
+        jp = self.normalised_joint_pos[:, self.prop_dof_indices]
+        jv = self.normalised_joint_vel[:, self.prop_dof_indices]
+        je = self.joint_pos_error[:, self.prop_dof_indices]
+
+        # Sensor noise: add to copies, not the underlying buffers — those are
+        # reused elsewhere (rewards, dones) and must stay clean.
+        p_std = getattr(self.cfg, "obs_noise_std_joint_pos", 0.0)
+        v_std = getattr(self.cfg, "obs_noise_std_joint_vel", 0.0)
+        e_std = getattr(self.cfg, "obs_noise_std_joint_pos_error", 0.0)
+        if p_std > 0.0:
+            jp = jp + torch.randn_like(jp) * p_std
+        if v_std > 0.0:
+            jv = jv + torch.randn_like(jv) * v_std
+        if e_std > 0.0:
+            je = je + torch.randn_like(je) * e_std
+
+        prop = torch.cat((jp, jv, je, self.actions), dim=-1)
 
         return prop
 
@@ -669,12 +690,15 @@ class RotoEnv(DirectRLEnv):
             env_ids: Environment indices to reset.
             joint_pos_noise: Standard deviation of noise added to joint positions.
         """
-        joint_pos = self.robot.data.default_joint_pos[env_ids] + sample_uniform(
+        noise = sample_uniform(
             -joint_pos_noise,
             joint_pos_noise,
             (len(env_ids), self.robot.num_joints),
             self.device,
         )
+        if getattr(self.cfg, "lock_coupled_dependent_at_zero", False):
+            noise[:, self.coupled_dependent_indices] = 0.0
+        joint_pos = self.robot.data.default_joint_pos[env_ids] + noise
         joint_pos = torch.clamp(joint_pos, self.robot_joint_pos_lower_limits, self.robot_joint_pos_upper_limits)
         joint_vel = torch.zeros_like(joint_pos)
         self.robot.set_joint_position_target(joint_pos, env_ids=env_ids)
