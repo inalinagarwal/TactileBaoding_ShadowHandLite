@@ -454,6 +454,68 @@ class ShadowLitePadTacEnv(ShadowLiteEnv):
         print("Tactile out dim:", NUM_TACTILE_CHANNELS)
 
         self._init_tactile_fsr_corrupt()
+        self._init_tactile_smoothing()
+
+    def _init_tactile_smoothing(self) -> None:
+        """Allocate the temporal hold-filter state; default OFF.
+
+        ``tactile_cfg.smoothing`` is an optional ``{k_on, k_off}`` block. A taxel
+        must read ON for ``k_on`` consecutive control steps before the policy
+        sees a 1, and OFF for ``k_off`` consecutive steps before it returns to 0.
+        ``k_on == k_off == 1`` (and an absent block) reproduce the raw signal.
+        """
+        cfg = (self.tactile_cfg or {}).get("smoothing")
+        self.use_tactile_smoothing = bool(cfg)
+        if not self.use_tactile_smoothing:
+            print("[taxel_smooth] off")
+            return
+
+        self._k_on = int(cfg.get("k_on", 1))
+        self._k_off = int(cfg.get("k_off", 1))
+        if self._k_on < 1 or self._k_off < 1:
+            raise ValueError(
+                f"tactile smoothing needs k_on >= 1 and k_off >= 1, got "
+                f"k_on={self._k_on}, k_off={self._k_off}"
+            )
+
+        shape = (self.num_envs, NUM_TACTILE_CHANNELS)
+        # Counters saturate at max(k_on, k_off) so a long hold cannot overflow.
+        self._tac_ct_max = max(self._k_on, self._k_off)
+        self._tac_on_ct = torch.zeros(shape, device=self.device, dtype=torch.int16)
+        self._tac_off_ct = torch.zeros(shape, device=self.device, dtype=torch.int16)
+        self._tac_hold_state = torch.zeros(shape, device=self.device, dtype=torch.float32)
+
+        print(
+            f"[taxel_smooth] hold filter on: k_on={self._k_on} k_off={self._k_off} "
+            f"(~{self._k_on * self.step_dt * 1e3:.0f} ms onset, "
+            f"~{self._k_off * self.step_dt * 1e3:.0f} ms release)"
+        )
+
+    def _apply_tactile_smoothing(self, tactile: torch.Tensor) -> torch.Tensor:
+        """Debounce the binary tactile vector in time. Returns strict 0.0/1.0.
+
+        Output must stay binary: DynamicsMemory stores ``tactile`` as ``torch.bool``
+        when ``binary_tactile`` is set (multimodal_rl/ssl/physics_memory.py:59),
+        so fractional values would be silently truncated on the SSL path.
+        """
+        raw = tactile > 0.5
+
+        # Consecutive-run counters; any interruption resets the opposing counter.
+        self._tac_on_ct = torch.where(raw, self._tac_on_ct + 1, torch.zeros_like(self._tac_on_ct))
+        self._tac_off_ct = torch.where(raw, torch.zeros_like(self._tac_off_ct), self._tac_off_ct + 1)
+        self._tac_on_ct.clamp_(max=self._tac_ct_max)
+        self._tac_off_ct.clamp_(max=self._tac_ct_max)
+
+        latched = self._tac_hold_state > 0.5
+        turn_on = ~latched & (self._tac_on_ct >= self._k_on)
+        turn_off = latched & (self._tac_off_ct >= self._k_off)
+
+        self._tac_hold_state = torch.where(
+            turn_on,
+            torch.ones_like(self._tac_hold_state),
+            torch.where(turn_off, torch.zeros_like(self._tac_hold_state), self._tac_hold_state),
+        )
+        return self._tac_hold_state.clone()
 
     def _init_tactile_fsr_corrupt(self) -> None:
         """Allocate episode-constant FSR corrupt buffers; default OFF."""
@@ -509,6 +571,14 @@ class ShadowLitePadTacEnv(ShadowLiteEnv):
         super()._reset_idx(env_ids)
         if getattr(self, "use_tactile_fsr_corrupt", False):
             self._sample_tactile_fsr_corrupt(env_ids)
+        # Clear hold-filter state so contacts cannot bleed across episodes:
+        # _reset_idx runs before _get_observations in the step loop.
+        if getattr(self, "use_tactile_smoothing", False):
+            ids = self.robot._ALL_INDICES if env_ids is None else env_ids
+            ids = torch.as_tensor(ids, device=self.device, dtype=torch.long).view(-1)
+            self._tac_on_ct[ids] = 0
+            self._tac_off_ct[ids] = 0
+            self._tac_hold_state[ids] = 0.0
 
     def _get_tactile(self):
         forces = self.robot_contact_sensor.data.net_forces_w[:].clone()
@@ -519,6 +589,11 @@ class ShadowLitePadTacEnv(ShadowLiteEnv):
 
         tactile = torch.zeros((self.num_envs, NUM_TACTILE_CHANNELS), device=self.device)
         tactile[:, self._pad_channels] = norm[:, self._pad_body_indices]
+
+        # Temporal debounce on the 24-d deploy vector, before the corrupt DR so a
+        # stuck-at sensor stays stuck (a broken channel is downstream of the filter).
+        if getattr(self, "use_tactile_smoothing", False):
+            tactile = self._apply_tactile_smoothing(tactile)
 
         if self.tactile_cfg is not None and self.tactile_cfg.get("zero_tactile", False):
             tactile.zero_()

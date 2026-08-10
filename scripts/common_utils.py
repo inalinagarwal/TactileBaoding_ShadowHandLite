@@ -76,11 +76,13 @@ _BAODING_SHADOW_AGENT_FILES = {
     "rl_only_pt_padtac_bt_ft_20hz": "rl_only_pt_padtac_bt_ft_20hz.yaml",
     "rl_only_pt_padtac_bt_ft_sweep": "rl_only_pt_padtac_bt_ft_sweep.yaml",
     "rl_only_pt_padtac_bt_sweep": "rl_only_pt_padtac_bt_sweep.yaml",
+    "rl_only_pt_padtac_bt_smooth": "rl_only_pt_padtac_bt_smooth.yaml",
     "rl_only_ptd": "rl_only_ptd.yaml",
     "rl_only_ptg": "rl_only_ptg.yaml",
     "tac_recon": "tac_recon.yaml",
     "full_recon": "full_recon.yaml",
     "forward_dynamics": "forward_dynamics.yaml",
+    "forward_dynamics_padtac_bt": "forward_dynamics_padtac_bt.yaml",
     "forward_dynamics_memory": "forward_dynamics_memory.yaml",
     "tac_dynamics": "tac_dynamics.yaml",
 }

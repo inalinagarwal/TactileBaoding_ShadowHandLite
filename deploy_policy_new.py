@@ -368,6 +368,34 @@ K_HI, K_LO = 5.0, 2.0
 bt_state = np.zeros(N_BIOTAC, dtype=bool)
 fsr_state = np.zeros(N_FSR, dtype=bool)
 
+# Temporal hold filter, mirroring ShadowLitePadTacEnv._apply_tactile_smoothing.
+# These MUST match observations.tactile_cfg.smoothing in the agent YAML the
+# deployed policy was trained with, or the obs distribution shifts under it.
+# K_ON = K_OFF = 1 disables the filter (raw signal, pre-filter behaviour).
+K_ON, K_OFF = 3, 1
+_hold_ct_max = max(K_ON, K_OFF)
+hold_on_ct = np.zeros(NUM_TACTILE, dtype=np.int16)
+hold_off_ct = np.zeros(NUM_TACTILE, dtype=np.int16)
+hold_state = np.zeros(NUM_TACTILE, dtype=np.float32)
+
+
+def apply_tactile_hold(t):
+    """Debounce the 24-d binary tactile vector in time. Returns strict 0.0/1.0."""
+    global hold_on_ct, hold_off_ct, hold_state
+    raw = t > 0.5
+
+    hold_on_ct = np.where(raw, hold_on_ct + 1, 0).astype(np.int16)
+    hold_off_ct = np.where(raw, 0, hold_off_ct + 1).astype(np.int16)
+    np.clip(hold_on_ct, None, _hold_ct_max, out=hold_on_ct)
+    np.clip(hold_off_ct, None, _hold_ct_max, out=hold_off_ct)
+
+    latched = hold_state > 0.5
+    turn_on = ~latched & (hold_on_ct >= K_ON)
+    turn_off = latched & (hold_off_ct >= K_OFF)
+
+    hold_state = np.where(turn_on, 1.0, np.where(turn_off, 0.0, hold_state)).astype(np.float32)
+    return hold_state.copy()
+
 
 def read_tactile():
     global fsr_state, bt_state
@@ -397,6 +425,8 @@ def read_tactile():
     if USE_BIOTAC:
         for k, ch in enumerate(BIOTAC_CH):
             t[ch] = max(t[ch], float(bt_state[k]))
+    if K_ON > 1 or K_OFF > 1:
+        t = apply_tactile_hold(t)
     return t
 
 
