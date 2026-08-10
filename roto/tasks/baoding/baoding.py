@@ -377,6 +377,10 @@ class BaodingShadowLitePadTacBTCfg(BaodingShadowLitePadTacCfg):
       cmd_speed_frac=0.5                    # fixed
       cmd_speed_frac_range=(0.3, 1.0)        # DR (leave cmd_speed_frac=None)
     Default both None = classic Trial-15/27 plant (no slew).
+
+    FSR taxel DR (opt-in via tactile_fsr_corrupt_max):
+      each episode corrupt k~U{0..max} of the 12 FSR channels to forced 0 or 1
+      (mixed); BioTac distal channels untouched. None = off.
     """
 
     robot_cfg: ArticulationCfg = (
@@ -386,10 +390,9 @@ class BaodingShadowLitePadTacBTCfg(BaodingShadowLitePadTacCfg):
         ShadowLitePadTacBTEnvCfg.__dataclass_fields__["robot_contact_sensor_cfg"].default_factory()
     )
 
-    # Opt-in matched cmd slew / DR (inherited defaults are None = off).
-    # Uncomment for overnight matched-slew scratch:
+    # Robust overnight scratch stack (toggle off individually for classic runs):
     cmd_speed_frac_range = (0.3, 1.0)
-
+    tactile_fsr_corrupt_max = 6
 
 @configclass
 class BaodingOrcaCfg(BaodingTaskCfg, OrcaEnvCfg):

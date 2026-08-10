@@ -85,11 +85,11 @@ class ShadowLiteEnvCfg(RotoEnvCfg):
     # native units of each signal. 0.0 disables (old cfgs stay noise-free). ---
     # Actuator noise: added to the raw [-1,1] action before scaling to joint cmds,
     # then stored into self.actions so the policy also sees it in its obs history.
-    action_noise_std: float = 0.02
+    action_noise_std: float = 0.0
     # Proprioception (sensor) noise, per prop sub-vector:
-    obs_noise_std_joint_pos: float = 0.01        # on normalised_joint_pos (~[-1,1])
-    obs_noise_std_joint_vel: float = 0.02        # on normalised_joint_vel (~[-1,1])
-    obs_noise_std_joint_pos_error: float = 0.01  # on joint_pos_error (rad, ~0.6 deg)
+    obs_noise_std_joint_pos: float = 0.0        # on normalised_joint_pos (~[-1,1])
+    obs_noise_std_joint_vel: float = 0.0        # on normalised_joint_vel (~[-1,1])
+    obs_noise_std_joint_pos_error: float = 0.0  # on joint_pos_error (rad, ~0.6 deg)
 
     tacsl_contact_expr: str | None = "{ENV_REGEX_NS}/ball1"
     """Prim path expression for the TacSL contact object.
@@ -247,6 +247,12 @@ class ShadowLiteEnvCfg(RotoEnvCfg):
     #   Off:    both None (default)
     cmd_speed_frac: float | None = None
     cmd_speed_frac_range: tuple[float, float] | None = None
+
+    # FSR taxel DR (binary 24-d obs). Opt-in; default OFF.
+    # Each episode: corrupt k ~ Uniform{0..max} of the 12 FSR channels only
+    # (PAD_LINK_TO_CHANNEL); each chosen channel forced independently to 0 or 1.
+    # BioTac distal channels (15/16/17/22) are never touched. None = off.
+    tactile_fsr_corrupt_max: int | None = None
 
     # GRDF coupling (experimental): derive the coupled J1/J2 commands from the
     # phase couplings declared in the GRDF robot file instead of the
@@ -438,10 +444,71 @@ class ShadowLitePadTacEnv(ShadowLiteEnv):
 
         self._pad_body_indices = torch.tensor(pad_body_indices, device=self.device, dtype=torch.long)
         self._pad_channels = torch.tensor(pad_channels, device=self.device, dtype=torch.long)
+        # Always the 12 physical FSR channel indices (never BioTac distals).
+        self._fsr_channels = torch.tensor(
+            list(PAD_LINK_TO_CHANNEL.values()), device=self.device, dtype=torch.long
+        )
 
         print("PAD TAC bodies:", [body_names[i] for i in pad_body_indices])
         print("PAD TAC channels:", pad_channels)
         print("Tactile out dim:", NUM_TACTILE_CHANNELS)
+
+        self._init_tactile_fsr_corrupt()
+
+    def _init_tactile_fsr_corrupt(self) -> None:
+        """Allocate episode-constant FSR corrupt buffers; default OFF."""
+        max_k = getattr(self.cfg, "tactile_fsr_corrupt_max", None)
+        self.use_tactile_fsr_corrupt = max_k is not None and int(max_k) > 0
+        self._tac_fsr_mask = torch.zeros(
+            (self.num_envs, NUM_TACTILE_CHANNELS), device=self.device, dtype=torch.bool
+        )
+        self._tac_fsr_val = torch.zeros(
+            (self.num_envs, NUM_TACTILE_CHANNELS), device=self.device, dtype=torch.float32
+        )
+        if not self.use_tactile_fsr_corrupt:
+            print("[taxel_dr] off")
+            return
+        self._tactile_fsr_corrupt_max = int(max_k)
+        if self._tactile_fsr_corrupt_max > len(self._fsr_channels):
+            raise ValueError(
+                f"tactile_fsr_corrupt_max={self._tactile_fsr_corrupt_max} exceeds "
+                f"n_fsr={len(self._fsr_channels)}"
+            )
+        print(
+            f"[taxel_dr] FSR corrupt k in [0, {self._tactile_fsr_corrupt_max}] "
+            f"(12 FSR only; mixed forced 0/1; BioTac untouched)"
+        )
+        self._sample_tactile_fsr_corrupt(None)
+
+    def _sample_tactile_fsr_corrupt(self, env_ids: Sequence[int] | None) -> None:
+        """Resample per-env FSR corrupt mask (episode-constant until next reset)."""
+        if not getattr(self, "use_tactile_fsr_corrupt", False):
+            return
+        if env_ids is None:
+            env_ids = self.robot._ALL_INDICES
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).view(-1)
+        n = env_ids.numel()
+        n_fsr = int(self._fsr_channels.numel())
+        max_k = self._tactile_fsr_corrupt_max
+
+        # Clear previous overrides on these envs.
+        self._tac_fsr_mask[env_ids] = False
+        self._tac_fsr_val[env_ids] = 0.0
+
+        # k ~ Uniform{0..max_k}; pick k FSR slots via random ranks; each gets 0 or 1.
+        k = torch.randint(0, max_k + 1, (n,), device=self.device)
+        scores = torch.rand(n, n_fsr, device=self.device)
+        ranks = scores.argsort(dim=-1).argsort(dim=-1)
+        active = ranks < k.unsqueeze(1)  # (n, 12)
+        values = torch.randint(0, 2, (n, n_fsr), device=self.device, dtype=torch.float32)
+
+        self._tac_fsr_mask[env_ids[:, None], self._fsr_channels[None, :]] = active
+        self._tac_fsr_val[env_ids[:, None], self._fsr_channels[None, :]] = values
+
+    def _reset_idx(self, env_ids: Sequence[int] | None):
+        super()._reset_idx(env_ids)
+        if getattr(self, "use_tactile_fsr_corrupt", False):
+            self._sample_tactile_fsr_corrupt(env_ids)
 
     def _get_tactile(self):
         forces = self.robot_contact_sensor.data.net_forces_w[:].clone()
@@ -455,6 +522,9 @@ class ShadowLitePadTacEnv(ShadowLiteEnv):
 
         if self.tactile_cfg is not None and self.tactile_cfg.get("zero_tactile", False):
             tactile.zero_()
+
+        if getattr(self, "use_tactile_fsr_corrupt", False):
+            tactile = torch.where(self._tac_fsr_mask, self._tac_fsr_val, tactile)
 
         self.last_tactile = self.tactile
         self.tactile = tactile
