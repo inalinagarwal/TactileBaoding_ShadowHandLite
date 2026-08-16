@@ -372,7 +372,9 @@ fsr_state = np.zeros(N_FSR, dtype=bool)
 # These MUST match observations.tactile_cfg.smoothing in the agent YAML the
 # deployed policy was trained with, or the obs distribution shifts under it.
 # K_ON = K_OFF = 1 disables the filter (raw signal, pre-filter behaviour).
-K_ON, K_OFF = 3, 1
+# Currently DISABLED: no training config sets a smoothing block, so filtering
+# here would put the policy off-distribution.
+K_ON, K_OFF = 1, 1
 _hold_ct_max = max(K_ON, K_OFF)
 hold_on_ct = np.zeros(NUM_TACTILE, dtype=np.int16)
 hold_off_ct = np.zeros(NUM_TACTILE, dtype=np.int16)

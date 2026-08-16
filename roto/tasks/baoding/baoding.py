@@ -393,6 +393,11 @@ class BaodingShadowLitePadTacBTCfg(BaodingShadowLitePadTacCfg):
     # Robust overnight scratch stack (toggle off individually for classic runs):
     cmd_speed_frac_range = (0.3, 1.0)
     tactile_fsr_corrupt_max = 6
+    # Per-step taxel noise on the 4 BioTac tips and any FSR channel not stuck by
+    # the line above. Dropout-heavy: taxels are mostly OFF, so an equal rate
+    # would produce far more phantom contacts than dropouts.
+    tactile_flip_prob_off_to_on = 0.01
+    tactile_flip_prob_on_to_off = 0.05
 
 @configclass
 class BaodingOrcaCfg(BaodingTaskCfg, OrcaEnvCfg):

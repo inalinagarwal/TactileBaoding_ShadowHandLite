@@ -254,6 +254,19 @@ class ShadowLiteEnvCfg(RotoEnvCfg):
     # BioTac distal channels (15/16/17/22) are never touched. None = off.
     tactile_fsr_corrupt_max: int | None = None
 
+    # Per-step taxel flip DR (binary 24-d obs). Opt-in; default OFF.
+    # Every control step each eligible channel flips independently: an OFF taxel
+    # reads 1 with prob tactile_flip_prob_off_to_on, an ON taxel reads 0 with
+    # prob tactile_flip_prob_on_to_off. Asymmetric on purpose -- taxels are OFF
+    # most of the time, so a symmetric rate would drown the ON class in phantom
+    # contacts. Eligible = the channels this hand populates (12 FSR, +4 BioTac
+    # on the BT env); the 8 structurally-empty slots stay zero.
+    # Applied upstream of tactile_fsr_corrupt_max, so a channel held by that
+    # episode-constant DR stays stuck: no channel is ever both broken and noisy.
+    # 0.0 = off.
+    tactile_flip_prob_off_to_on: float = 0.0
+    tactile_flip_prob_on_to_off: float = 0.0
+
     # GRDF coupling (experimental): derive the coupled J1/J2 commands from the
     # phase couplings declared in the GRDF robot file instead of the
     # coupling_theta split above. Same law today, but the coupling lives in the
@@ -454,7 +467,48 @@ class ShadowLitePadTacEnv(ShadowLiteEnv):
         print("Tactile out dim:", NUM_TACTILE_CHANNELS)
 
         self._init_tactile_fsr_corrupt()
+        self._init_tactile_flip()
         self._init_tactile_smoothing()
+
+    def _init_tactile_flip(self) -> None:
+        """Allocate the per-step taxel flip DR mask; default OFF."""
+        p_off_on = float(getattr(self.cfg, "tactile_flip_prob_off_to_on", 0.0) or 0.0)
+        p_on_off = float(getattr(self.cfg, "tactile_flip_prob_on_to_off", 0.0) or 0.0)
+        for name, p in (("off_to_on", p_off_on), ("on_to_off", p_on_off)):
+            if not 0.0 <= p <= 1.0:
+                raise ValueError(f"tactile_flip_prob_{name} must be in [0, 1], got {p}")
+
+        self.use_tactile_flip = p_off_on > 0.0 or p_on_off > 0.0
+        self._tac_p_off_on = p_off_on
+        self._tac_p_on_off = p_on_off
+        if not self.use_tactile_flip:
+            print("[taxel_flip] off")
+            return
+
+        # Only the channels this hand actually populates are eligible. The 8
+        # structurally-empty slots (world/forearm/thbase/thhub/*tip) must stay
+        # zero -- flipping them would invent sensors that exist nowhere.
+        mask = torch.zeros((1, NUM_TACTILE_CHANNELS), device=self.device, dtype=torch.bool)
+        mask[0, self._pad_channels] = True
+        self._tac_flip_mask = mask
+
+        print(
+            f"[taxel_flip] per-step flip on: p(0->1)={p_off_on} p(1->0)={p_on_off} "
+            f"over {int(mask.sum())} channels (stuck channels excluded downstream)"
+        )
+
+    def _apply_tactile_flip(self, tactile: torch.Tensor) -> torch.Tensor:
+        """Randomly flip eligible taxels. Returns strict 0.0/1.0.
+
+        Output must stay binary: DynamicsMemory stores ``tactile`` as ``torch.bool``
+        when ``binary_tactile`` is set (multimodal_rl/ssl/physics_memory.py:59),
+        which the forward-dynamics configs turn on.
+        """
+        # tactile is exactly 0.0/1.0, so this selects p_on_off where it is on and
+        # p_off_on where it is off, without allocating an index tensor.
+        p = self._tac_p_off_on + (self._tac_p_on_off - self._tac_p_off_on) * tactile
+        flip = (torch.rand_like(tactile) < p) & self._tac_flip_mask
+        return torch.where(flip, 1.0 - tactile, tactile)
 
     def _init_tactile_smoothing(self) -> None:
         """Allocate the temporal hold-filter state; default OFF.
@@ -594,6 +648,11 @@ class ShadowLitePadTacEnv(ShadowLiteEnv):
         # stuck-at sensor stays stuck (a broken channel is downstream of the filter).
         if getattr(self, "use_tactile_smoothing", False):
             tactile = self._apply_tactile_smoothing(tactile)
+
+        # Per-step flip DR. Before zero_tactile so the prop-only ablation stays
+        # all-zero, and before the corrupt DR so stuck channels stay stuck.
+        if getattr(self, "use_tactile_flip", False):
+            tactile = self._apply_tactile_flip(tactile)
 
         if self.tactile_cfg is not None and self.tactile_cfg.get("zero_tactile", False):
             tactile.zero_()
