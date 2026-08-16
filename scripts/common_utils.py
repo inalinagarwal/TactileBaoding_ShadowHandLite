@@ -83,6 +83,7 @@ _BAODING_SHADOW_AGENT_FILES = {
     "full_recon": "full_recon.yaml",
     "forward_dynamics": "forward_dynamics.yaml",
     "forward_dynamics_padtac_bt": "forward_dynamics_padtac_bt.yaml",
+    "forward_dynamics_padtac_bt_smooth_sweep": "forward_dynamics_padtac_bt_smooth_sweep.yaml",
     "forward_dynamics_memory": "forward_dynamics_memory.yaml",
     "tac_dynamics": "tac_dynamics.yaml",
 }

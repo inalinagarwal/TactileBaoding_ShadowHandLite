@@ -1,0 +1,51 @@
+# Scratch Optuna sweep: padtac_bt + forward-dynamics SSL + tactile hold filter.
+# Use with scripts/sweep.py. Matches ongoing rl_only_pt_padtac_bt_sweep budgets (350M).
+# Own DB — does not write shadow_baoding_padtac_bt_scratch.db.
+# No zero_tactile (full FSR+BioTac taxels).
+#
+# smoothing k_on=3 / k_off=1 must match deploy_policy_new.py K_ON/K_OFF when deploying.
+
+observations:
+  tactile_cfg:
+    smoothing:
+      k_on: 3
+      k_off: 1
+
+agent:
+  rollouts: 32
+  learning_epochs: 8
+  mini_batches: 4
+  discount_factor: 0.99
+  lambda: 0.95
+  learning_rate: 2.02e-04
+  grad_norm_clip: 1.0
+  ratio_clip: 0.2
+  value_clip: 0.2
+  value_loss_scale: 1.0
+  entropy_loss_scale: 0.05
+  kl_threshold: 0
+
+# seq_length > 0 allocates DynamicsMemory (~385 MB at 4096 envs). Reduce --num_envs if OOM.
+ssl_task:
+  type: forward_dynamics
+  n_rollouts: 1
+  tactile_only: false
+  loss_weight: 3.686
+  learning_rate: 2.83e-04
+  seq_length: 3
+
+experiment:
+  experiment_name: forward_dynamics_padtac_bt_smooth_sweep
+  wandb: 0
+  wandb_kwargs:
+    group: forward_dynamics_padtac_bt_smooth_sweep
+    name: '1'
+
+trainer:
+  num_eval_envs: 100
+  max_global_timesteps_M: 350
+
+sweeper:
+  storage: sqlite:///shadow_baoding_padtac_bt_fd_ssl_smooth.db
+  warmup_timesteps_M: 120
+  max_sweep_timesteps_M: 350
