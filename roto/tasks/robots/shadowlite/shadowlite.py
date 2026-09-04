@@ -249,21 +249,22 @@ class ShadowLiteEnvCfg(RotoEnvCfg):
     cmd_speed_frac_range: tuple[float, float] | None = None
 
     # FSR taxel DR (binary 24-d obs). Opt-in; default OFF.
-    # Each episode: corrupt k ~ Uniform{0..max} of the 12 FSR channels only
-    # (PAD_LINK_TO_CHANNEL); each chosen channel forced independently to 0 or 1.
+    # Each episode: select k ~ Uniform{0..max} of the 12 FSR channels only
+    # (PAD_LINK_TO_CHANNEL); each chosen channel gets a forced value of 0 or 1.
+    # The forced value is a baseline, not a hold -- tactile_flip_prob_* below
+    # dithers these channels so a broken taxel is intermittent.
     # BioTac distal channels (15/16/17/22) are never touched. None = off.
     tactile_fsr_corrupt_max: int | None = None
 
-    # Per-step taxel flip DR (binary 24-d obs). Opt-in; default OFF.
-    # Every control step each eligible channel flips independently: an OFF taxel
-    # reads 1 with prob tactile_flip_prob_off_to_on, an ON taxel reads 0 with
-    # prob tactile_flip_prob_on_to_off. Asymmetric on purpose -- taxels are OFF
-    # most of the time, so a symmetric rate would drown the ON class in phantom
-    # contacts. Eligible = the channels this hand populates (12 FSR, +4 BioTac
-    # on the BT env); the 8 structurally-empty slots stay zero.
-    # Applied upstream of tactile_fsr_corrupt_max, so a channel held by that
-    # episode-constant DR stays stuck: no channel is ever both broken and noisy.
-    # 0.0 = off.
+    # Per-step dither on the SELECTED FSR channels (binary 24-d obs). Opt-in;
+    # default OFF. Requires tactile_fsr_corrupt_max > 0.
+    # A selected channel is intermittent, not locked: it reads its forced value
+    # on ~(1 - p) of control steps and the opposite on ~p, resampled each step.
+    #   forced 1 -> reads 1 with prob (1 - tactile_flip_prob_on_to_off)
+    #   forced 0 -> reads 1 with prob tactile_flip_prob_off_to_on
+    # Scope is exactly the k selected channels. The other (12 - k) FSR pads, all
+    # 4 BioTac channels, and the 8 structurally-empty slots are never touched and
+    # carry the exact contact signal. 0.0 = off.
     tactile_flip_prob_off_to_on: float = 0.0
     tactile_flip_prob_on_to_off: float = 0.0
 
@@ -485,20 +486,28 @@ class ShadowLitePadTacEnv(ShadowLiteEnv):
             print("[taxel_flip] off")
             return
 
-        # Only the channels this hand actually populates are eligible. The 8
-        # structurally-empty slots (world/forearm/thbase/thhub/*tip) must stay
-        # zero -- flipping them would invent sensors that exist nowhere.
-        mask = torch.zeros((1, NUM_TACTILE_CHANNELS), device=self.device, dtype=torch.bool)
-        mask[0, self._pad_channels] = True
-        self._tac_flip_mask = mask
+        # Scope: the k FSR channels picked by the episode-constant corrupt draw,
+        # and nothing else. The mask is _tac_fsr_mask, so it is per-env and is
+        # resampled at every reset. Without a corrupt draw nothing is selected
+        # and the flip would be a silent no-op, so refuse that combination.
+        if not getattr(self, "use_tactile_fsr_corrupt", False):
+            raise ValueError(
+                "tactile_flip_prob_* requires tactile_fsr_corrupt_max > 0: the "
+                "per-step dither is scoped to the FSR channels selected by the "
+                "corrupt draw, so with no draw it would do nothing."
+            )
 
         print(
-            f"[taxel_flip] per-step flip on: p(0->1)={p_off_on} p(1->0)={p_on_off} "
-            f"over {int(mask.sum())} channels (stuck channels excluded downstream)"
+            f"[taxel_flip] per-step dither on selected FSR channels only: "
+            f"p(0->1)={p_off_on} p(1->0)={p_on_off}; unselected FSR pads and all "
+            f"BioTac channels stay exact"
         )
 
     def _apply_tactile_flip(self, tactile: torch.Tensor) -> torch.Tensor:
-        """Randomly flip eligible taxels. Returns strict 0.0/1.0.
+        """Dither the selected (forced) taxels only. Returns strict 0.0/1.0.
+
+        Masked by ``_tac_fsr_mask``, so unselected FSR pads and every BioTac
+        channel pass through exactly. Non-selected channels are never noised.
 
         Output must stay binary: DynamicsMemory stores ``tactile`` as ``torch.bool``
         when ``binary_tactile`` is set (multimodal_rl/ssl/physics_memory.py:59),
@@ -507,7 +516,7 @@ class ShadowLitePadTacEnv(ShadowLiteEnv):
         # tactile is exactly 0.0/1.0, so this selects p_on_off where it is on and
         # p_off_on where it is off, without allocating an index tensor.
         p = self._tac_p_off_on + (self._tac_p_on_off - self._tac_p_off_on) * tactile
-        flip = (torch.rand_like(tactile) < p) & self._tac_flip_mask
+        flip = (torch.rand_like(tactile) < p) & self._tac_fsr_mask
         return torch.where(flip, 1.0 - tactile, tactile)
 
     def _init_tactile_smoothing(self) -> None:
@@ -644,21 +653,24 @@ class ShadowLitePadTacEnv(ShadowLiteEnv):
         tactile = torch.zeros((self.num_envs, NUM_TACTILE_CHANNELS), device=self.device)
         tactile[:, self._pad_channels] = norm[:, self._pad_body_indices]
 
-        # Temporal debounce on the 24-d deploy vector, before the corrupt DR so a
-        # stuck-at sensor stays stuck (a broken channel is downstream of the filter).
+        # Temporal debounce on the raw sensor signal, upstream of the corrupt DR
+        # and flip so smoothing acts on genuine contact, not stuck/flipped values.
         if getattr(self, "use_tactile_smoothing", False):
             tactile = self._apply_tactile_smoothing(tactile)
 
+        # Corrupt DR before flip: the forced value is the baseline the dither
+        # acts on, so a selected channel sits at its value ~(1 - p) of the time
+        # and takes the opposite ~p. The flip is masked to these same channels.
+        if getattr(self, "use_tactile_fsr_corrupt", False):
+            tactile = torch.where(self._tac_fsr_mask, self._tac_fsr_val, tactile)
+
         # Per-step flip DR. Before zero_tactile so the prop-only ablation stays
-        # all-zero, and before the corrupt DR so stuck channels stay stuck.
+        # all-zero.
         if getattr(self, "use_tactile_flip", False):
             tactile = self._apply_tactile_flip(tactile)
 
         if self.tactile_cfg is not None and self.tactile_cfg.get("zero_tactile", False):
             tactile.zero_()
-
-        if getattr(self, "use_tactile_fsr_corrupt", False):
-            tactile = torch.where(self._tac_fsr_mask, self._tac_fsr_val, tactile)
 
         self.last_tactile = self.tactile
         self.tactile = tactile

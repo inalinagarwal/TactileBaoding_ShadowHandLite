@@ -21,7 +21,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sim.schemas.schemas_cfg import CollisionPropertiesCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import sample_uniform
+from isaaclab.utils.math import quat_rotate_inverse, sample_uniform
 
 from roto.tasks.robots.allegro.allegro import (
     ALLEGRO_BAODING_ROOT_ROT_WXYZ,
@@ -173,6 +173,23 @@ class BaodingTaskCfg:
     ball_2_cfg: RigidObjectCfg = _OBJ["ball_2_cfg"]  # type: ignore[assignment]
     target1_cfg: VisualizationMarkersCfg = _OBJ["target1_cfg"]  # type: ignore[assignment]
     target2_cfg: VisualizationMarkersCfg = _OBJ["target2_cfg"]  # type: ignore[assignment]
+
+    # --- Ball disturbance DR: random mid-episode pushes on the balls ---
+    # All None = feature off entirely (default, so existing runs are unchanged).
+    # Every quantity below is sampled INDEPENDENTLY per ball, unlike
+    # ball_friction_range / ball_mass_range which deliberately share one sample
+    # across both balls. A bump is a local event; friction/mass are plant params.
+    #
+    # Two disturbance kinds fire together on each trigger:
+    #   * a velocity kick   -> instantaneous impulse (the "bump")
+    #   * a force burst     -> a world-frame force held for a few control steps
+    # Set either pair of ranges to None to use only the other kind.
+    ball_disturb_interval_s: tuple[float, float] | None = None  # re-fire interval, seconds
+    ball_push_vel_range: tuple[float, float] | None = None      # m/s, linear velocity kick
+    ball_push_angvel_range: tuple[float, float] | None = None   # rad/s, angular velocity kick
+    ball_force_range: tuple[float, float] | None = None         # N, world-frame force burst
+    ball_torque_range: tuple[float, float] | None = None        # N*m, body-frame torque burst
+    ball_force_burst_steps: tuple[int, int] | None = None       # control steps a burst lasts
 
 
 def apply_baoding_object_cfgs_from_scalars(cfg: BaodingTaskCfg) -> None:
@@ -379,8 +396,11 @@ class BaodingShadowLitePadTacBTCfg(BaodingShadowLitePadTacCfg):
     Default both None = classic Trial-15/27 plant (no slew).
 
     FSR taxel DR (opt-in via tactile_fsr_corrupt_max):
-      each episode corrupt k~U{0..max} of the 12 FSR channels to forced 0 or 1
-      (mixed); BioTac distal channels untouched. None = off.
+      each episode select k~U{0..max} of the 12 FSR channels and give each a
+      forced value of 0 or 1 (mixed); BioTac distal channels untouched.
+      tactile_flip_prob_* then dithers ONLY those k channels, so a broken taxel
+      is intermittent (~90/10) rather than locked for the episode. Every
+      unselected FSR pad and all 4 BioTac channels stay exact. None = off.
     """
 
     robot_cfg: ArticulationCfg = (
@@ -391,13 +411,45 @@ class BaodingShadowLitePadTacBTCfg(BaodingShadowLitePadTacCfg):
     )
 
     # Robust overnight scratch stack (toggle off individually for classic runs):
-    cmd_speed_frac_range = (0.3, 1.0)
-    tactile_fsr_corrupt_max = 6
-    # Per-step taxel noise on the 4 BioTac tips and any FSR channel not stuck by
-    # the line above. Dropout-heavy: taxels are mostly OFF, so an equal rate
-    # would produce far more phantom contacts than dropouts.
-    tactile_flip_prob_off_to_on = 0.01
-    tactile_flip_prob_on_to_off = 0.05
+    cmd_speed_frac_range = None #(0.3, 1.0)
+    tactile_fsr_corrupt_max = 8
+    # Ball disturbance DR. Velocity kick only -- the force burst is switched off.
+    # Values below were measured, not guessed; the rig and full tables are in
+    # scripts/random_forces/ (see its README).
+    #
+    # Why the kick range moved from (0.0, 0.05) to (0.1, 0.3):
+    #   * 0.05 m/s (the old max) moves a cradled 55 g ball ~0.05 mm -- about
+    #     1/600th of a ball diameter. It was effectively a no-op.
+    #   * Everything below ~0.1 m/s is inert, so a range starting at 0 spent most
+    #     of its draws doing nothing. A band beats a ceiling.
+    #   * Above ~0.4 m/s the ball is knocked permanently into an adjacent cradle
+    #     pocket rather than perturbed, so 0.3 is a deliberate cap.
+    #   * Measured at (0.1, 0.3): mean 1.53 mm peak displacement, max 9.5 mm, ball
+    #     always recovers, no cumulative drift over 60 s.
+    #
+    # Why the force burst is off rather than retuned:
+    #   * At its shipped 0.15 N max it moved the ball 0.03-0.22 mm -- inert, same
+    #     order as the old kick. Contact absorbs it; holding it 4x longer buys 16%
+    #     more displacement, so impulse (F x t) reasoning does not apply.
+    #   * Its response is a cliff, not a dial: nothing below ~0.35 N (0.65x body
+    #     weight), then ~90x more displacement by 0.40 N, and the ball is thrown
+    #     clear of the hand somewhere below 1.0 N. The kick is graded throughout
+    #     and is therefore the safer knob.
+    #
+    # Interval lower bound sits above the settle window (15 steps = 0.25 s @ 60 Hz);
+    # the countdown is frozen while settling anyway, this just keeps it obvious.
+    # NOTE: both balls are kicked independently on every trigger, so ~10 triggers
+    # per 10 s episode means ~20 individual ball-kicks.
+    ball_disturb_interval_s = (0.5, 1.5)   # seconds between pushes, per env
+    ball_push_vel_range = (0.1, 0.3)       # m/s instantaneous bump
+    ball_force_range = None                # force burst OFF
+    ball_force_burst_steps = None          # unused while ball_force_range is None
+    # Per-step dither applied ONLY to the k FSR channels selected above. A
+    # channel forced to 1 reads 1 on ~90% of steps and drops to 0 on ~10%; a
+    # channel forced to 0 reads 0 on ~90% and blips to 1 on ~10%. Unselected FSR
+    # pads and all 4 BioTac tips are never noised and stay exact.
+    tactile_flip_prob_off_to_on = 0.1
+    tactile_flip_prob_on_to_off = 0.1
 
 @configclass
 class BaodingOrcaCfg(BaodingTaskCfg, OrcaEnvCfg):
@@ -521,6 +573,41 @@ class BaodingMixin:
         # pose while balls settle. Set to cfg.settle_steps on every reset.
         self.settle_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
+        self._init_ball_disturbance()
+
+    def _init_ball_disturbance(self) -> None:
+        """Allocate buffers for random mid-episode pushes on the balls.
+
+        Off unless at least one disturbance range is configured, in which case
+        _ball_disturb_on gates the whole per-step path so the default costs nothing.
+        """
+        c = self.cfg
+        self._ball_kick_on = (
+            getattr(c, "ball_push_vel_range", None) is not None
+            or getattr(c, "ball_push_angvel_range", None) is not None
+        )
+        self._ball_burst_on = (
+            getattr(c, "ball_force_range", None) is not None
+            or getattr(c, "ball_torque_range", None) is not None
+        )
+        self._ball_disturb_on = self._ball_kick_on or self._ball_burst_on
+        if not self._ball_disturb_on:
+            return
+
+        if getattr(c, "ball_disturb_interval_s", None) is None:
+            raise ValueError(
+                "Ball disturbance DR is configured (a push/force range is set) but "
+                "cfg.ball_disturb_interval_s is None, so it would never fire. Set it "
+                "to e.g. (0.5, 1.5) seconds, or clear the push/force ranges to disable."
+            )
+
+        # Axis 1 is the ball index: 0 = ball_1, 1 = ball_2, matching the (ball_1, ball_2)
+        # tuple order used in _step_ball_disturbance.
+        self._ball_dist_time_left = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self._ball_force_w = torch.zeros((self.num_envs, 2, 3), dtype=torch.float, device=self.device)
+        self._ball_torque_b = torch.zeros((self.num_envs, 2, 3), dtype=torch.float, device=self.device)
+        self._ball_burst_left = torch.zeros((self.num_envs, 2), dtype=torch.long, device=self.device)
+
     def _setup_scene(self) -> None:
         super()._setup_scene()
         self.ball_1 = RigidObject(self.cfg.ball_1_cfg)
@@ -630,6 +717,137 @@ class BaodingMixin:
 
         # Restart settle countdown so the hand holds its pose while balls drop.
         self.settle_counter[env_ids] = getattr(self.cfg, "settle_steps", 0)
+
+        # getattr guard: _init_baoding_state() runs after super().__init__(), so match
+        # the defensive style used for settle_counter in roto_env._pre_physics_step.
+        if getattr(self, "_ball_disturb_on", False):
+            self._reset_ball_disturbance(env_ids)
+
+    def _reset_ball_disturbance(self, env_ids: Sequence[int]) -> None:
+        """Clear any in-flight burst and schedule the first disturbance of the episode.
+
+        scene.reset(env_ids) has already zeroed RigidObject._external_force_b for these
+        envs, so no stale wrench survives the episode boundary; we only need to clear
+        our own bookkeeping and re-arm the timer.
+        """
+        lo, hi = self.cfg.ball_disturb_interval_s
+        n = len(env_ids)
+        self._ball_dist_time_left[env_ids] = sample_uniform(lo, hi, (n,), device=self.device)
+        self._ball_force_w[env_ids] = 0.0
+        self._ball_torque_b[env_ids] = 0.0
+        self._ball_burst_left[env_ids] = 0
+
+    def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        super()._pre_physics_step(actions)
+        if getattr(self, "_ball_disturb_on", False):
+            self._step_ball_disturbance()
+
+    def _sample_isotropic(self, rng: tuple[float, float], n: int) -> torch.Tensor:
+        """n vectors with uniformly-random direction and magnitude drawn from ``rng``.
+
+        Normalising a Gaussian gives a direction uniform on the sphere. Sampling each
+        axis independently from sample_uniform would instead sample a *cube*, biasing
+        pushes toward its corners (a diagonal push would be sqrt(3)x stronger than an
+        axis-aligned one), which is not what "random direction" should mean here.
+        """
+        lo, hi = rng
+        d = torch.randn((n, 3), device=self.device)
+        d = d / d.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        return d * sample_uniform(lo, hi, (n, 1), device=self.device)
+
+    def _step_ball_disturbance(self) -> None:
+        """Fire random pushes / force bursts at the balls, once per control step.
+
+        The countdown is frozen while an env is settling, so the configured interval
+        measures time under policy control and a push can never land while the balls
+        are still dropping into the palm.
+        """
+        balls = (self.ball_1, self.ball_2)
+
+        # Expire in-flight bursts BEFORE re-arming, so a burst armed this step gets
+        # its full lifetime. Masking (rather than boolean-index assignment) keeps this
+        # elementwise and free of a GPU->CPU sync.
+        if self._ball_burst_on:
+            self._ball_burst_left.sub_(1).clamp_(min=0)
+            live = (self._ball_burst_left > 0).unsqueeze(-1).to(self._ball_force_w.dtype)
+            self._ball_force_w.mul_(live)
+            self._ball_torque_b.mul_(live)
+
+        # Advance the timer only for envs under policy control. super()._pre_physics_step
+        # has already decremented settle_counter this step (roto_env.py:326), so this
+        # starts ticking on exactly the step the hand takes over.
+        running = (self.settle_counter == 0).to(self._ball_dist_time_left.dtype)
+        self._ball_dist_time_left.sub_(running * self.step_dt)
+
+        # One sync per control step, and only when this DR is enabled. Isaac Lab's own
+        # EventManager does the same for "interval" terms (event_manager.py:218-228);
+        # the alternative -- a masked root-velocity write for all envs every step --
+        # would re-write velocities into PhysX continuously, which is worse for a
+        # contact-rich task than a single sync.
+        due = (self._ball_dist_time_left < 1e-6).nonzero().flatten()
+        if due.numel() > 0:
+            lo, hi = self.cfg.ball_disturb_interval_s
+            self._ball_dist_time_left[due] = sample_uniform(lo, hi, (due.numel(),), device=self.device)
+            if self._ball_kick_on:
+                self._apply_ball_kick(due, balls)
+            if self._ball_burst_on:
+                self._arm_ball_burst(due)
+
+        if self._ball_burst_on:
+            self._write_ball_wrench(balls)
+
+    def _apply_ball_kick(self, due: torch.Tensor, balls) -> None:
+        """Instantaneous velocity bump, sampled independently per ball.
+
+        Same effect as mdp.push_by_setting_velocity (events.py:795), inlined so it
+        shares the settle gate and can use isotropic rather than per-axis sampling.
+        Root velocities are in the world frame, so no rotation is needed here.
+        """
+        n = due.numel()
+        for ball in balls:
+            vel = ball.data.root_vel_w[due].clone()
+            if self.cfg.ball_push_vel_range is not None:
+                vel[:, 0:3] += self._sample_isotropic(self.cfg.ball_push_vel_range, n)
+            if self.cfg.ball_push_angvel_range is not None:
+                vel[:, 3:6] += self._sample_isotropic(self.cfg.ball_push_angvel_range, n)
+            ball.write_root_velocity_to_sim(vel, env_ids=due)
+
+    def _arm_ball_burst(self, due: torch.Tensor) -> None:
+        """Start a new force/torque burst, sampled independently per ball."""
+        n = due.numel()
+        for i in range(2):
+            if self.cfg.ball_force_range is not None:
+                self._ball_force_w[due, i] = self._sample_isotropic(self.cfg.ball_force_range, n)
+            if self.cfg.ball_torque_range is not None:
+                self._ball_torque_b[due, i] = self._sample_isotropic(self.cfg.ball_torque_range, n)
+        lo, hi = getattr(self.cfg, "ball_force_burst_steps", None) or (1, 1)
+        self._ball_burst_left[due] = torch.randint(lo, hi + 1, (n, 2), device=self.device)
+
+    def _write_ball_wrench(self, balls) -> None:
+        """Push the active burst into the sim, re-projected into each ball's body frame.
+
+        RigidObject applies external wrenches with is_global=False
+        (rigid_object.py:115-122), i.e. in the body frame. Baoding balls spin
+        continuously, so a force stored in the body frame would co-rotate with the ball
+        and wash out instead of pushing in one direction. We therefore keep the sampled
+        force in the WORLD frame and rotate it back into the body frame every control
+        step. (Within a step the body frame drifts across the 4 substeps; at 60 Hz that
+        residual is negligible.)
+
+        The write must cover ALL envs, never a subset: set_external_force_and_torque
+        toggles a single asset-wide has_external_wrench flag off when handed an
+        all-zero tensor (rigid_object.py:379-383), so writing only the active envs
+        would let one env's burst expiring silently disable the force on every other
+        env. Passing the full buffer makes the flag mean "some env is active" and
+        delivers the zeros to expired envs through the same call.
+        """
+        for i, ball in enumerate(balls):
+            force_b = quat_rotate_inverse(ball.data.root_quat_w, self._ball_force_w[:, i])
+            ball.set_external_force_and_torque(
+                force_b.unsqueeze(1),
+                self._ball_torque_b[:, i].unsqueeze(1),
+                env_ids=None,
+            )
 
     def _reset_object(self, env_ids: Sequence[int]) -> None:
         self._baoding_reset_balls(env_ids)

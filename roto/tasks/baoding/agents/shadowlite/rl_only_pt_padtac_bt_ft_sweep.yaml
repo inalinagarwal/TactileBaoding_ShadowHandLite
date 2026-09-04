@@ -28,6 +28,6 @@ trainer:
   max_global_timesteps_M: 250
 
 sweeper:
-  storage: sqlite:///shadow_baoding_padtac_bt_ft_sweep.db
+  storage: sqlite:///shadow_baoding_padtac_bt_ft_sweep_2.db
   warmup_timesteps_M: 40
   max_sweep_timesteps_M: 100

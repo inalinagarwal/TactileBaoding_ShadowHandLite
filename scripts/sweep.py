@@ -189,13 +189,13 @@ class OptimisationRunner:
         # Suggest PPO hyperparameters
         # Note: Memory issues can occur with large rollouts + aux tasks     
         if "ssl_task" in agent_cfg and agent_cfg["ssl_task"]["type"] == "forward_dynamics":
-            max_rollouts_pow = 5
+            max_rollouts_pow = 4
             
         else:
             max_rollouts_pow = 6
 
         rollouts = 2 ** trial.suggest_int("rollouts_pow", 4, max_rollouts_pow) # 16, 32, 64
-        mini_batches = trial.suggest_categorical("mini_batches", [4, 8, 16, 32])
+        mini_batches = trial.suggest_categorical("mini_batches", [8, 16, 32]) # removed 4
         learning_epochs = trial.suggest_int("learning_epochs", low=4, high=10, step=1)
         learning_rate = trial.suggest_float("learning_rate", low=1e-5, high=5e-4, log=True)
         entropy_loss_scale = trial.suggest_float("entropy_loss_scale", 1e-4, 0.01, log=True)
@@ -357,8 +357,8 @@ if __name__ == "__main__":
     agent_cfg["trainer"]["max_global_timesteps_M"] = max_sweep_timesteps_M
 
     study_name = args_cli.study
-    total_trials = 40
-    n_startup_trials = 8
+    total_trials = 10 #40
+    n_startup_trials = 5 #8
     interval_steps = 1
 
     writer = Writer(agent_cfg, delay_wandb_startup=True)

@@ -45,6 +45,6 @@ trainer:
   max_global_timesteps_M: 350
 
 sweeper:
-  storage: sqlite:///shadow_baoding_padtac_bt_fd_ssl.db
+  storage: sqlite:///shadow_baoding_padtac_bt_fd_ssl_3.db
   warmup_timesteps_M: 120
   max_sweep_timesteps_M: 350
